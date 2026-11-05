@@ -1,0 +1,9 @@
+node_modules/
+android/
+www/index.html
+www/index.html.asr-patched.html
+*.apk
+*.aab
+.DS_Store
+__pycache__/
+*.py[cod]

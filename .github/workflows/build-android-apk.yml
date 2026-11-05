@@ -1,0 +1,79 @@
+name: Build KoboldAI Mobile APK
+
+on:
+  push:
+    branches:
+      - mobile/android-apk
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-debug-apk:
+    name: Build debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout mobile branch
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Install pinned Capacitor dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run source tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Check JavaScript syntax
+        run: node --check patch/kobold_lite_external_asr_mobile.js
+
+      - name: Fetch and patch official KoboldAI Lite
+        run: python scripts/prepare_lite.py
+
+      - name: Generate Android project
+        run: npx cap add android
+
+      - name: Apply Android microphone and LAN permissions
+        run: python scripts/patch_android_manifest.py
+
+      - name: Sync Capacitor project
+        run: npx cap sync android
+
+      - name: Build debug APK
+        working-directory: android
+        run: chmod +x ./gradlew && ./gradlew --no-daemon assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: KoboldAI-Mobile-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14

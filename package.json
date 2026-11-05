@@ -1,0 +1,25 @@
+{
+  "name": "koboldai-mobile-android",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Android WebView shell for official KoboldAI Lite with built-in KoboldCpp ASR and GigaSTT external ASR.",
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "prepare:lite": "python scripts/prepare_lite.py",
+    "test:source": "python -m unittest discover -s tests -v",
+    "check:js": "node --check patch/kobold_lite_external_asr_mobile.js",
+    "android:add": "cap add android",
+    "android:sync": "cap sync android",
+    "android:open": "cap open android"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.6.0",
+    "@capacitor/core": "8.6.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.6.0"
+  }
+}

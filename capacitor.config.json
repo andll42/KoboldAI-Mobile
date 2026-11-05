@@ -1,0 +1,20 @@
+{
+  "appId": "net.koboldai.mobile",
+  "appName": "KoboldAI Mobile",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": true,
+    "initialFocus": true,
+    "zoomEnabled": true,
+    "loggingBehavior": "production"
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": false
+    }
+  },
+  "server": {
+    "hostname": "localhost",
+    "androidScheme": "https"
+  }
+}

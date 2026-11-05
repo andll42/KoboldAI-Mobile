@@ -1,0 +1,1 @@
+The upstream Lite HTML is fetched at build time by scripts/prepare_lite.py and patched after an exact LITEVER/structure check. Do not drop an arbitrary index.html here: the build script intentionally generates www/index.html.
