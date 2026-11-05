@@ -1,7 +1,8 @@
-/* KOBOLD_LITE_EXTERNAL_ASR_PATCH v4-mobile
+/* KOBOLD_LITE_EXTERNAL_ASR_PATCH v5-android-asr
  * Injected into the official KoboldAI Lite pwa-setup script immediately before init().
- * Adds a selectable OpenAI-compatible ASR provider without replacing KoboldCpp Whisper.
- * The upstream microphone/VAD/MediaRecorder/WAV/LLM/TTS paths remain in place.
+ * Adds GigaSTT/OpenAI-compatible ASR and a strict native Android on-device ASR option.
+ * KoboldCpp and GigaSTT continue to use the upstream microphone/VAD/MediaRecorder/WAV path.
+ * Android ASR delegates microphone capture to SpeechRecognizer and never falls back online.
  */
 (function installKoboldLiteExternalASR() {
     if (window.__koboldLiteExternalASRInstalled) return;
@@ -15,6 +16,7 @@
         "asr_model",
         "asr_api_key",
         "asr_extra_fields",
+        "asr_android_language",
         "voice_langcode"
     ];
 
@@ -25,6 +27,7 @@
     localsettings.asr_model = localsettings.asr_model || "";
     localsettings.asr_api_key = localsettings.asr_api_key || "";
     localsettings.asr_extra_fields = localsettings.asr_extra_fields || "";
+    localsettings.asr_android_language = localsettings.asr_android_language || "ru-RU";
 
     defaultsettings.asr_provider = "koboldcpp";
     defaultsettings.asr_base_url = "";
@@ -32,6 +35,7 @@
     defaultsettings.asr_model = "";
     defaultsettings.asr_api_key = "";
     defaultsettings.asr_extra_fields = "";
+    defaultsettings.asr_android_language = "ru-RU";
 
     // Prevent imported story settings from replacing this browser's ASR profile.
     // The API key is separately redacted from exported save files below.
@@ -45,7 +49,8 @@
         ASR_FIELDS.forEach(field => {
             result[field] = localsettings[field] == null ? "" : String(localsettings[field]);
         });
-        result.asr_provider = result.asr_provider === "openai" ? "openai" : "koboldcpp";
+        result.asr_provider = ["openai", "android"].includes(result.asr_provider) ? result.asr_provider : "koboldcpp";
+        result.asr_android_language = result.asr_android_language || "ru-RU";
         result.asr_endpoint_path = result.asr_endpoint_path || "/audio/transcriptions";
         result.asr_model = result.asr_model || "";
         result.voice_langcode = result.voice_langcode || "auto";
@@ -55,12 +60,13 @@
     function sanitizeAsrSettings(value) {
         if (!value || typeof value !== "object" || Array.isArray(value)) return null;
         const safe = {
-            asr_provider: value.asr_provider === "openai" ? "openai" : "koboldcpp",
+            asr_provider: ["openai", "android"].includes(value.asr_provider) ? value.asr_provider : "koboldcpp",
             asr_base_url: typeof value.asr_base_url === "string" ? value.asr_base_url.slice(0, 2048) : "",
             asr_endpoint_path: typeof value.asr_endpoint_path === "string" ? value.asr_endpoint_path.slice(0, 512) : "/audio/transcriptions",
             asr_model: typeof value.asr_model === "string" ? value.asr_model.slice(0, 256) : "",
             asr_api_key: typeof value.asr_api_key === "string" ? value.asr_api_key.slice(0, 4096) : "",
             asr_extra_fields: typeof value.asr_extra_fields === "string" ? value.asr_extra_fields.slice(0, 4096) : "",
+            asr_android_language: typeof value.asr_android_language === "string" ? value.asr_android_language.slice(0, 32) : "ru-RU",
             voice_langcode: typeof value.voice_langcode === "string" ? value.voice_langcode.slice(0, 32) : "auto"
         };
         return safe;
@@ -84,12 +90,13 @@
 
     function getAsrConfig() {
         return {
-            provider: localsettings.asr_provider === "openai" ? "openai" : "koboldcpp",
+            provider: ["openai", "android"].includes(localsettings.asr_provider) ? localsettings.asr_provider : "koboldcpp",
             baseUrl: String(localsettings.asr_base_url || "").trim(),
             endpointPath: String(localsettings.asr_endpoint_path || "/audio/transcriptions").trim(),
             model: String(localsettings.asr_model || "").trim(),
             apiKey: String(localsettings.asr_api_key || "").trim(),
             extraFields: String(localsettings.asr_extra_fields || "").trim(),
+            androidLanguage: String(localsettings.asr_android_language || "ru-RU").trim() || "ru-RU",
             language: String(localsettings.voice_langcode || "auto").trim(),
             suppressNonSpeech: !!localsettings.voice_suppress_nonspeech
         };
@@ -172,10 +179,87 @@
     const originalConfirmSettings = confirm_settings;
     const originalImportProps = import_props_into_object;
     const originalGenerateSavefile = generate_savefile;
+    const originalInitVoiceTyping = init_voice_typing;
+    const originalPttStart = ptt_start;
+    const originalPttEnd = ptt_end;
+    const originalUpdateSubmitButton = update_submit_button;
+
+    let androidNativeStatus = null;
+    let androidStatusPromise = null;
+    let androidInitPromise = null;
+    let androidListenersRegistered = false;
+    let androidNativeListening = false;
+    let androidStartPromise = null;
+    let androidDetectShouldResume = false;
+    let androidResumeTimer = null;
+    let androidToggleTranscriptBuffer = [];
+    let androidManualStopRequested = false;
+
+    function isAndroidNativeApp() {
+        return !!(window.Capacitor && typeof window.Capacitor.isNativePlatform === "function" &&
+            window.Capacitor.isNativePlatform() && typeof window.Capacitor.getPlatform === "function" &&
+            window.Capacitor.getPlatform() === "android");
+    }
+
+    function getAndroidSpeechPlugin() {
+        return isAndroidNativeApp() ? window.KoboldAndroidSpeech : null;
+    }
+
+    async function refreshAndroidAsrStatus(force) {
+        const plugin = getAndroidSpeechPlugin();
+        if (!plugin) {
+            androidNativeStatus = { available: false, message: "Android On-device ASR is available only in the KoboldAI Mobile Android app." };
+            if (typeof window.update_asr_ui === "function") window.update_asr_ui(false);
+            return androidNativeStatus;
+        }
+        if (androidStatusPromise && !force) return androidStatusPromise;
+        androidStatusPromise = (async () => {
+            try {
+                const device = await plugin.getStatus();
+                if (!device || !device.onDeviceAvailable) {
+                    androidNativeStatus = { available: false, device, message: "This Android device does not expose an on-device SpeechRecognizer service. No online fallback will be used." };
+                    return androidNativeStatus;
+                }
+                const language = getAsrConfig().androidLanguage;
+                const support = await plugin.checkLanguageSupport({ language });
+                let available = !!device.onDeviceAvailable;
+                let message = "On-device recognizer is available. Language support will be confirmed when recognition starts.";
+                const state = support && support.languageStatus;
+                if (state === "installed") {
+                    available = true;
+                    message = "Offline language " + language + " is installed on this device.";
+                } else if (state === "downloadable") {
+                    available = false;
+                    message = "Language " + language + " is supported but not installed. Use the explicit Download language model button, then check again.";
+                } else if (state === "pending") {
+                    available = false;
+                    message = "The offline language model " + language + " is pending installation. Check again after Android finishes.";
+                } else if (state === "unsupported") {
+                    available = false;
+                    message = "The on-device service does not list " + language + " as an installed or downloadable language.";
+                } else if (state === "unknown") {
+                    available = true;
+                    message = "Android cannot enumerate language packs on this version/service. Strict on-device recognition will test " + language + " when started.";
+                }
+                androidNativeStatus = { available, device, support, message };
+                return androidNativeStatus;
+            } catch (error) {
+                androidNativeStatus = { available: false, message: "Could not check Android on-device ASR: " + (error.message || String(error)) };
+                return androidNativeStatus;
+            } finally {
+                androidStatusPromise = null;
+                if (typeof window.update_asr_ui === "function") window.update_asr_ui(false);
+                if (androidNativeStatus && androidNativeStatus.message) setAsrStatus(androidNativeStatus.message, !androidNativeStatus.available);
+            }
+        })();
+        return androidStatusPromise;
+    }
 
     function asrIsAvailable() {
         const cfg = getAsrConfig();
-        return cfg.provider === "openai" ? isExternalAsrConfigured() : originalKcppWhisperProbe();
+        if (cfg.provider === "openai") return isExternalAsrConfigured();
+        if (cfg.provider === "android") return isAndroidNativeApp() && !!(androidNativeStatus && androidNativeStatus.available);
+        return originalKcppWhisperProbe();
     }
 
     // This is the capability predicate used by Lite's voice button, recording,
@@ -199,12 +283,13 @@
         languageRow.insertAdjacentHTML("beforebegin", `
             <div class="settinglabel" id="asr_provider_row">
                 <div class="justifyleft" style="padding:2px">ASR Provider
-                    <span class="helpicon">?<span class="helptext">Built-in uses KoboldCpp Whisper (or its audio-capable projector). Custom uses an external OpenAI-compatible transcription server and does not require Whisper in KoboldCpp.</span></span>
+                    <span class="helpicon">?<span class="helptext">Choose built-in KoboldCpp Whisper, an external GigaSTT/OpenAI-compatible server, or strict Android on-device speech recognition. Android ASR uses the phone microphone directly and never falls back to an online recognizer.</span></span>
                 </div>
                 <div class="push-right">
                     <select title="ASR Provider" class="form-control" id="asr_provider" onchange="update_asr_ui()">
-                        <option value="koboldcpp">Built-in KoboldCpp</option>
-                        <option value="openai">Custom OpenAI-compatible ASR</option>
+                        <option value="koboldcpp">Built-in KoboldCpp Whisper</option>
+                        <option value="openai">GigaSTT / OpenAI-compatible ASR</option>
+                        <option value="android">Android On-device ASR (Google/System)</option>
                     </select>
                 </div>
             </div>
@@ -256,65 +341,109 @@
                     <button type="button" class="btn btn-default" id="asr_ready_btn" onclick="test_external_asr_readiness()">Check GigaSTT readiness</button>
                 </div>
             </div>
+            <div class="settinglabel hidden" id="asr_android_language_row">
+                <div class="justifyleft" style="padding:2px">Android ASR language</div>
+                <div class="push-right" style="width:60%">
+                    <select title="Android on-device recognition language" class="form-control" id="asr_android_language" onchange="update_asr_ui()">
+                        <option value="ru-RU">Russian (ru-RU)</option>
+                        <option value="en-US">English (US)</option>
+                        <option value="de-DE">German (Germany)</option>
+                    </select>
+                </div>
+            </div>
+            <div class="settinglabel hidden" id="asr_android_check_row">
+                <div class="justifyleft" style="padding:2px">Android on-device service</div>
+                <div class="push-right">
+                    <button type="button" class="btn btn-primary" id="asr_android_check_btn" onclick="check_android_asr_support()">Check device support</button>
+                </div>
+            </div>
+            <div class="settinglabel hidden" id="asr_android_download_row">
+                <div class="justifyleft" style="padding:2px">Offline language model</div>
+                <div class="push-right">
+                    <button type="button" class="btn btn-default" id="asr_android_download_btn" onclick="request_android_asr_model()">Download language model</button>
+                </div>
+            </div>
             <div class="menutext hidden" id="asr_status" role="status" aria-live="polite"></div>
             <div class="menutext hidden" id="asr_cors_note" style="font-size:0.9em">
-                Test connection and GigaSTT readiness send GET only; they never activate the microphone or upload audio. In KoboldAI Mobile the app origin is https://localhost; allow that exact origin on GigaSTT. The APK permits HTTP only for the configured private-LAN backend path. Keep GigaSTT/KoboldCpp off public port forwarding. Desktop browser copies still need normal HTTPS/CORS rules.
+                Test connection and GigaSTT readiness send GET only; they never activate the microphone or upload audio. In KoboldAI Mobile the app origin is https://localhost; allow that exact origin on GigaSTT. Keep GigaSTT/KoboldCpp limited to trusted private Wi-Fi and off public port forwarding.
+            </div>
+            <div class="menutext hidden" id="asr_android_note" style="font-size:0.9em">
+                Android ASR captures audio directly through Android SpeechRecognizer. It requires an installed on-device language model to work offline. The app uses createOnDeviceSpeechRecognizer only; it will not fall back to the network recognizer. Model download is requested only when you press the button.
             </div>
         `);
 
         const voiceModeHelp = document.querySelector("#voice_typing_mode")?.closest(".settinglabel")?.querySelector(".helptext");
         if (voiceModeHelp) {
-            voiceModeHelp.textContent = "Requires either built-in KoboldCpp transcription or a configured external OpenAI-compatible ASR server. Supports Detect Voice, Push-To-Talk and Toggle-To-Talk.";
+            voiceModeHelp.textContent = "Select KoboldCpp Whisper, GigaSTT/OpenAI-compatible ASR, or Android on-device ASR. Android uses the system speech service and does not require the PC Whisper model. Supports Detect Voice, Push-To-Talk and Toggle-To-Talk.";
         }
     }
 
     function syncAsrControlsFromSettings() {
         const provider = document.getElementById("asr_provider");
         if (!provider) return;
-        provider.value = localsettings.asr_provider || "koboldcpp";
+        provider.value = ["openai", "android"].includes(localsettings.asr_provider) ? localsettings.asr_provider : "koboldcpp";
         document.getElementById("asr_base_url").value = localsettings.asr_base_url || "";
         document.getElementById("asr_endpoint_path").value = localsettings.asr_endpoint_path || "/audio/transcriptions";
         document.getElementById("asr_model").value = localsettings.asr_model || "";
         document.getElementById("asr_api_key").value = localsettings.asr_api_key || "";
         document.getElementById("asr_extra_fields").value = localsettings.asr_extra_fields || "";
+        const androidLanguage = document.getElementById("asr_android_language");
+        if (androidLanguage) androidLanguage.value = localsettings.asr_android_language || "ru-RU";
         update_asr_ui();
     }
 
-    window.update_asr_ui = function update_asr_ui() {
+    window.update_asr_ui = function update_asr_ui(refreshNative = true) {
         const provider = document.getElementById("asr_provider");
         if (!provider) return;
 
-        // Keep the live capability check in step with edits made in the settings UI.
-        localsettings.asr_provider = provider.value === "openai" ? "openai" : "koboldcpp";
+        localsettings.asr_provider = ["openai", "android"].includes(provider.value) ? provider.value : "koboldcpp";
         localsettings.asr_base_url = document.getElementById("asr_base_url").value.trim();
         localsettings.asr_endpoint_path = document.getElementById("asr_endpoint_path").value.trim() || "/audio/transcriptions";
         localsettings.asr_model = document.getElementById("asr_model").value.trim();
         localsettings.asr_api_key = document.getElementById("asr_api_key").value.trim();
         localsettings.asr_extra_fields = document.getElementById("asr_extra_fields").value;
+        const androidLanguage = document.getElementById("asr_android_language");
+        localsettings.asr_android_language = androidLanguage ? androidLanguage.value : (localsettings.asr_android_language || "ru-RU");
 
         const custom = localsettings.asr_provider === "openai";
-        ["asr_base_url_row", "asr_endpoint_path_row", "asr_model_row", "asr_api_key_row", "asr_extra_fields_row", "asr_test_row", "asr_ready_row", "asr_status", "asr_cors_note"].forEach(id => {
+        const android = localsettings.asr_provider === "android";
+        ["asr_base_url_row", "asr_endpoint_path_row", "asr_model_row", "asr_api_key_row", "asr_extra_fields_row", "asr_test_row", "asr_ready_row", "asr_cors_note"].forEach(id => {
             const element = document.getElementById(id);
             if (element) element.classList.toggle("hidden", !custom);
         });
+        ["asr_android_language_row", "asr_android_check_row", "asr_android_note"].forEach(id => {
+            const element = document.getElementById(id);
+            if (element) element.classList.toggle("hidden", !android);
+        });
+        const androidDownloadRow = document.getElementById("asr_android_download_row");
+        if (androidDownloadRow) androidDownloadRow.classList.toggle("hidden", !android || !(androidNativeStatus && androidNativeStatus.support && androidNativeStatus.support.languageStatus === "downloadable"));
+        const androidOption = provider.querySelector('option[value="android"]');
+        if (androidOption) {
+            androidOption.disabled = !isAndroidNativeApp();
+            androidOption.title = androidOption.disabled ? "Available only inside KoboldAI Mobile for Android." : "Strict Android on-device speech recognition; no online fallback.";
+        }
+        const statusElement = document.getElementById("asr_status");
+        if (statusElement) statusElement.classList.toggle("hidden", !(custom || android));
 
         const suppress = document.getElementById("voice_suppress_nonspeech");
         if (suppress) {
-            suppress.disabled = custom;
-            suppress.title = custom ? "This KoboldCpp-specific option is not sent to external ASR servers." : "Suppress non-speech sounds during built-in transcription.";
+            suppress.disabled = custom || android;
+            suppress.title = custom || android ? "This option is used only by the built-in KoboldCpp Whisper endpoint." : "Suppress non-speech sounds during built-in transcription.";
         }
 
         const available = asrIsAvailable();
         const voiceMode = document.getElementById("voice_typing_mode");
         const fileButton = document.getElementById("transcribe_file_btn");
         if (voiceMode) voiceMode.disabled = !available;
-        if (fileButton) fileButton.disabled = !available;
-        if (typeof update_mini_action_toggles_visibility === "function") {
-            update_mini_action_toggles_visibility();
+        if (fileButton) {
+            fileButton.disabled = !available || android;
+            fileButton.title = android ? "Android on-device SpeechRecognizer listens to the live microphone; use KoboldCpp or GigaSTT for audio files." : "Transcribe an audio attachment/file.";
         }
-        if (typeof update_submit_button === "function") {
-            update_submit_button(false);
-        }
+        if (typeof update_mini_action_toggles_visibility === "function") update_mini_action_toggles_visibility();
+        if (typeof update_submit_button === "function") update_submit_button(false);
+
+        if (refreshNative && android) refreshAndroidAsrStatus(false);
+        if (!android && androidInitPromise) stopAndroidSpeech(true);
     };
 
     window.load_kobold_lite_external_asr_settings = async function load_kobold_lite_external_asr_settings() {
@@ -416,6 +545,289 @@
         }
     };
 
+    window.check_android_asr_support = async function check_android_asr_support() {
+        if (!isAndroidNativeApp() || !getAndroidSpeechPlugin()) {
+            setAsrStatus("Android On-device ASR is available only inside the Android APK.", true);
+            return;
+        }
+        const status = await refreshAndroidAsrStatus(true);
+        setAsrStatus(status.message || "Android ASR support check finished.", !status.available);
+    };
+
+    window.request_android_asr_model = async function request_android_asr_model() {
+        const plugin = getAndroidSpeechPlugin();
+        if (!plugin) {
+            setAsrStatus("Android on-device language model download is available only in the Android APK.", true);
+            return;
+        }
+        try {
+            const result = await plugin.requestLanguageModelDownload({ language: getAsrConfig().androidLanguage });
+            setAsrStatus(result.message || "Android language model download was requested. Check support again later.", false);
+        } catch (error) {
+            setAsrStatus(error.message || String(error), true);
+        }
+    };
+
+    function submitAndroidTranscript(text) {
+        const trimmed = String(text || "").trim();
+        const noise = trimmed.startsWith("(") && trimmed.endsWith(")");
+        const blank = trimmed.startsWith("[") && trimmed.endsWith("]");
+        if (!trimmed || noise || blank) return false;
+        const sendButton = document.getElementById("btnsend");
+        if (!sendButton || sendButton.disabled || voice_is_processing || tts_is_playing) {
+            setAsrStatus("Speech was recognized, but generation is currently busy. The text was not submitted automatically.", true);
+            return false;
+        }
+        document.getElementById("input_text").value = trimmed;
+        prepare_submit_generation();
+        return true;
+    }
+
+    function registerAndroidSpeechListeners() {
+        const plugin = getAndroidSpeechPlugin();
+        if (!plugin || androidListenersRegistered) return;
+        androidListenersRegistered = true;
+        plugin.addListener("listening", () => {
+            androidNativeListening = true;
+            setAsrStatus("Android on-device recognizer is listening (" + getAsrConfig().androidLanguage + ").", false);
+        });
+        plugin.addListener("speechStart", () => {
+            voice_is_recording = true;
+            update_submit_button(false);
+        });
+        plugin.addListener("speechEnd", () => {
+            voice_is_recording = false;
+            update_submit_button(false);
+        });
+        plugin.addListener("partial", event => {
+            if (event && event.text) setAsrStatus("Recognizing locally: " + event.text, false);
+        });
+        plugin.addListener("retry", event => {
+            setAsrStatus("Android is waiting for speech: " + ((event && event.message) || "No speech detected yet."), false);
+        });
+        plugin.addListener("result", async event => {
+            const mode = Number(localsettings.voice_typing_mode || 0);
+            const text = event && event.text ? String(event.text).trim() : "";
+            voice_is_recording = false;
+            voice_is_processing = false;
+            if (mode === 2 || mode === 3) {
+                if (text) androidToggleTranscriptBuffer.push(text);
+                // Android emits phrase-sized results while a manual session is
+                // active. Buffer until Push-To-Talk release or the second
+                // Toggle-To-Talk press; never re-arm after the user stopped.
+                if (!androidManualStopRequested) voice_is_speaking = true;
+                update_submit_button(false);
+                return;
+            }
+            voice_is_speaking = false;
+            if (mode === 1) {
+                androidDetectShouldResume = true;
+                try { await plugin.stopListening(); } catch (error) { console.warn("Could not pause Android Detect Voice:", error); }
+            }
+            update_submit_button(false);
+            if (text) submitAndroidTranscript(text);
+            if (mode === 1) scheduleAndroidDetectResume();
+        });
+        plugin.addListener("stopped", event => {
+            androidNativeListening = false;
+            voice_is_recording = false;
+            voice_is_processing = false;
+            const stoppedMode = Number(localsettings.voice_typing_mode || 0);
+            if ((stoppedMode === 2 || stoppedMode === 3) && (androidManualStopRequested || !voice_is_speaking)) {
+                const transcript = androidToggleTranscriptBuffer.join(" ").trim();
+                androidToggleTranscriptBuffer = [];
+                androidManualStopRequested = false;
+                voice_is_speaking = false;
+                submitAndroidTranscript(transcript);
+            }
+            update_submit_button(false);
+            if (event && event.reason === "error") isVoiceInputConfigured = false;
+        });
+        plugin.addListener("error", event => {
+            androidNativeListening = false;
+            voice_is_recording = false;
+            voice_is_processing = false;
+            voice_is_speaking = false;
+            androidDetectShouldResume = false;
+            androidManualStopRequested = false;
+            androidToggleTranscriptBuffer = [];
+            const code = Number(event && event.code);
+            const message = (event && event.message) || "Android on-device speech recognition failed.";
+            // Silence/no-match/busy are normal for a manual Push-To-Talk or
+            // Toggle-To-Talk session; keep Voice Input configured for the next try.
+            if (code === 6 || code === 7 || code === 8) {
+                setAsrStatus(message + " You can press the microphone and try again. No online fallback was used.", false);
+                update_submit_button(false);
+                return;
+            }
+            isVoiceInputConfigured = false;
+            setAsrStatus(message + " No online recognizer fallback was used.", true);
+            localsettings.voice_typing_mode = 0;
+            const mode = document.getElementById("voice_typing_mode");
+            if (mode) mode.value = "0";
+            update_asr_ui(false);
+            update_submit_button(false);
+        });
+    }
+
+    async function ensureAndroidAsrInitialized() {
+        const plugin = getAndroidSpeechPlugin();
+        if (!plugin) throw new Error("Android ASR is available only in the KoboldAI Mobile Android app.");
+        if (androidInitPromise) return androidInitPromise;
+        androidInitPromise = (async () => {
+            registerAndroidSpeechListeners();
+            const status = await refreshAndroidAsrStatus(true);
+            if (!status.available) throw new Error(status.message || "Android on-device speech recognition is unavailable.");
+            await plugin.requestMicrophonePermission();
+            isVoiceInputConfigured = true;
+            setAsrStatus("Android microphone permission granted. On-device recognition is ready.", false);
+            return true;
+        })().catch(error => {
+            androidInitPromise = null;
+            isVoiceInputConfigured = false;
+            throw error;
+        });
+        return androidInitPromise;
+    }
+
+    async function startAndroidListening(continuous) {
+        const plugin = getAndroidSpeechPlugin();
+        if (!plugin) throw new Error("Android SpeechRecognizer bridge is missing from this APK build.");
+        if (androidNativeListening) return { started: true, alreadyListening: true };
+        if (androidStartPromise) return androidStartPromise;
+        androidStartPromise = (async () => {
+            await ensureAndroidAsrInitialized();
+            voice_is_recording = true;
+            voice_is_processing = false;
+            update_submit_button(false);
+            try {
+                const result = await plugin.startListening({ language: getAsrConfig().androidLanguage, continuous: !!continuous });
+                androidNativeListening = true;
+                setAsrStatus("Android on-device ASR started for " + result.language + ". Audio is handled by the Android on-device recognizer; no network recognizer fallback is used.", false);
+                return result;
+            } catch (error) {
+                voice_is_recording = false;
+                androidNativeListening = false;
+                update_submit_button(false);
+                throw error;
+            }
+        })().finally(() => { androidStartPromise = null; });
+        return androidStartPromise;
+    }
+
+    async function stopAndroidSpeech(cancel) {
+        const plugin = getAndroidSpeechPlugin();
+        androidDetectShouldResume = false;
+        androidManualStopRequested = false;
+        androidToggleTranscriptBuffer = [];
+        if (plugin) {
+            try {
+                if (cancel) await plugin.cancelListening();
+                else await plugin.stopListening();
+            } catch (error) { console.warn("Could not stop Android ASR:", error); }
+        }
+        voice_is_recording = false;
+        voice_is_processing = false;
+        voice_is_speaking = false;
+        androidNativeListening = false;
+        isVoiceInputConfigured = false;
+        androidInitPromise = null;
+    }
+
+    function scheduleAndroidDetectResume() {
+        if (!androidDetectShouldResume || androidResumeTimer) return;
+        androidResumeTimer = setTimeout(async () => {
+            androidResumeTimer = null;
+            const sendButton = document.getElementById("btnsend");
+            if (getAsrConfig().provider !== "android" || Number(localsettings.voice_typing_mode || 0) !== 1 ||
+                !androidDetectShouldResume || !isVoiceInputConfigured || !sendButton || sendButton.disabled ||
+                voice_is_processing || tts_is_playing || is_popup_open()) return;
+            androidDetectShouldResume = false;
+            try { await startAndroidListening(true); }
+            catch (error) {
+                androidDetectShouldResume = false;
+                setAsrStatus(error.message || String(error), true);
+            }
+        }, 550);
+    }
+
+    // Detect Voice pauses while an LLM response is in progress and resumes after
+    // Lite enables the send button again. This mirrors ready_to_record()'s gate.
+    update_submit_button = function (...args) {
+        const result = originalUpdateSubmitButton.apply(this, args);
+        if (getAsrConfig().provider === "android" && Number(localsettings.voice_typing_mode || 0) === 1) scheduleAndroidDetectResume();
+        return result;
+    };
+
+    init_voice_typing = function (...args) {
+        if (getAsrConfig().provider !== "android") return originalInitVoiceTyping.apply(this, args);
+        ensureAndroidAsrInitialized().then(() => {
+            const mode = Number(localsettings.voice_typing_mode || 0);
+            if (mode === 1) return startAndroidListening(true);
+            if (mode === 2 && voice_is_speaking) return startAndroidListening(true);
+            if (mode === 3 && voice_is_speaking) return startAndroidListening(true);
+            return null;
+        }).catch(error => {
+            setAsrStatus(error.message || String(error), true);
+            localsettings.voice_typing_mode = 0;
+            const mode = document.getElementById("voice_typing_mode");
+            if (mode) mode.value = "0";
+            update_asr_ui(false);
+        });
+    };
+
+    ptt_start = function (...args) {
+        if (getAsrConfig().provider !== "android") return originalPttStart.apply(this, args);
+        if (localsettings.voice_typing_mode == 3 && voice_is_speaking) {
+            androidManualStopRequested = true;
+            ptt_end(true);
+            return;
+        }
+        if (Number(localsettings.voice_typing_mode || 0) <= 0) return;
+        if (Number(localsettings.voice_typing_mode) === 2 || Number(localsettings.voice_typing_mode) === 3) {
+            androidManualStopRequested = false;
+            androidToggleTranscriptBuffer = [];
+        }
+        voice_is_speaking = true;
+        ++voice_speaking_counter;
+        if (!isVoiceInputConfigured) {
+            init_voice_typing();
+            return;
+        }
+        if (!ready_to_record()) return;
+        voice_is_recording = true;
+        update_submit_button(false);
+        startAndroidListening(Number(localsettings.voice_typing_mode) === 2 || Number(localsettings.voice_typing_mode) === 3).catch(error => {
+            voice_is_recording = false;
+            voice_is_speaking = false;
+            setAsrStatus(error.message || String(error), true);
+            update_submit_button(false);
+        });
+    };
+
+    ptt_end = function (force = false) {
+        if (getAsrConfig().provider !== "android") return originalPttEnd.apply(this, arguments);
+        if (localsettings.voice_typing_mode == 3 && !force) return;
+        if (Number(localsettings.voice_typing_mode || 0) <= 0) return;
+        if (Number(localsettings.voice_typing_mode) === 2 || (Number(localsettings.voice_typing_mode) === 3 && force)) {
+            androidManualStopRequested = true;
+        }
+        voice_is_speaking = false;
+        const delay = Math.max(0, Number(localsettings.voice_end_delay || 0));
+        setTimeout(async () => {
+            if (voice_is_speaking) return;
+            voice_is_processing = true;
+            update_submit_button(false);
+            const plugin = getAndroidSpeechPlugin();
+            if (!plugin) return;
+            try { await plugin.stopListening(); }
+            catch (error) {
+                voice_is_processing = false;
+                setAsrStatus(error.message || String(error), true);
+            }
+        }, delay);
+    };
+
     // Keep upstream settings UI and save flow; the separate ASR profile is loaded
     // before init() and remains available when persist_session is disabled.
     display_settings = function (...args) {
@@ -425,11 +837,23 @@
     };
 
     confirm_settings = function (...args) {
+        const previousProvider = getAsrConfig().provider;
         const provider = document.getElementById("asr_provider");
         if (provider) update_asr_ui();
         const result = originalConfirmSettings.apply(this, args);
-        update_asr_ui(); // refresh the mic/send button after voice_typing_mode is applied upstream
+        const currentProvider = getAsrConfig().provider;
+        update_asr_ui(false); // refresh voice button after Lite commits settings
         persistAsrSettings();
+        if (previousProvider === "android" && currentProvider !== "android") {
+            stopAndroidSpeech(true).then(() => {
+                if (Number(localsettings.voice_typing_mode || 0) > 0) {
+                    isVoiceInputConfigured = false;
+                    originalInitVoiceTyping();
+                }
+            });
+        } else if (currentProvider === "android" && Number(localsettings.voice_typing_mode || 0) > 0) {
+            init_voice_typing();
+        }
         return result;
     };
 
@@ -514,6 +938,9 @@
     async function transcribeDataUrl(dataUrl) {
         const cfg = getAsrConfig();
 
+        if (cfg.provider === "android") {
+            throw new Error("Android On-device ASR listens to the live microphone through SpeechRecognizer; it does not transcribe uploaded audio files. Select GigaSTT or KoboldCpp Whisper for file transcription.");
+        }
         if (cfg.provider !== "openai") {
             // Preserve the current KoboldCpp Lite JSON contract exactly.
             const payload = {
@@ -663,6 +1090,10 @@
     };
 
     transcribe_file_btn = function () {
+        if (getAsrConfig().provider === "android") {
+            if (typeof msgbox === "function") msgbox("Android On-device ASR processes live microphone input only. Select GigaSTT or KoboldCpp Whisper to transcribe an audio file.", "Android ASR");
+            return;
+        }
         if (!asrIsAvailable()) {
             if (typeof msgbox === "function") msgbox("Configure an available ASR provider in Settings > Media > Audio Input first.", "ASR Not Available");
             return;
@@ -686,5 +1117,7 @@
 
     insertAsrSettingsUI();
     syncAsrControlsFromSettings();
-    console.log("KoboldAI Lite external ASR adapter v3 installed.");
+    if (getAsrConfig().provider === "android") refreshAndroidAsrStatus(true);
+    registerAndroidSpeechListeners();
+    console.log("KoboldAI Lite ASR adapter v5 installed (KoboldCpp + GigaSTT + Android on-device).");
 })();

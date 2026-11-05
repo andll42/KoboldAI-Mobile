@@ -51,8 +51,11 @@ jobs:
       - name: Run source tests
         run: python -m unittest discover -s tests -v
 
+      - name: Build native Android ASR JavaScript bridge
+        run: npm run build:native-bridge
+
       - name: Check JavaScript syntax
-        run: node --check patch/kobold_lite_external_asr_mobile.js
+        run: npm run check:js
 
       - name: Fetch and patch official KoboldAI Lite
         run: python scripts/prepare_lite.py
@@ -60,7 +63,10 @@ jobs:
       - name: Generate Android project
         run: npx cap add android
 
-      - name: Apply Android microphone and LAN permissions
+      - name: Install/register strict Android on-device SpeechRecognizer plugin
+        run: python scripts/patch_android_native_asr.py
+
+      - name: Apply Android microphone, speech-service and LAN permissions
         run: python scripts/patch_android_manifest.py
 
       - name: Sync Capacitor project

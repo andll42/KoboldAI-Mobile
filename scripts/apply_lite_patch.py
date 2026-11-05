@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the external ASR adapter to the reviewed official KoboldAI Lite LITEVER 353 for Android."""
+"""Apply the external ASR adapter to the reviewed official KoboldAI Lite LITEVER 341 for Android."""
 from __future__ import annotations
 
 import argparse
@@ -8,11 +8,11 @@ import shutil
 import sys
 from pathlib import Path
 
-PATCH_MARKER = "KOBOLD_LITE_EXTERNAL_ASR_PATCH v4-mobile"
-EXPECTED_LITEVER = 353
+PATCH_MARKER = "KOBOLD_LITE_EXTERNAL_ASR_PATCH v5-android-asr"
+EXPECTED_LITEVER = 341
 
 REQUIRED_ANCHORS = (
-    'const LITEVER = 353;',
+    'const LITEVER = 341;',
     'const PROTECTED_FIELDS = {',
     'const defaultsettings = JSON.parse(JSON.stringify(localsettings));',
     'function indexeddb_save(objkey, objdatastr)',
@@ -40,8 +40,6 @@ REQUIRED_ANCHORS = (
     'function ready_to_record()',
     'function submit_generation_button(aesthetic_ui)',
     'function update_submit_button(full_update)',
-    'function update_mini_action_toggles_visibility()',
-    'function toggle_voice_input_minibtn()',
     'function dispatch_transcribe_audio(dataurl)',
     'function transcribe_audio_file(audiohash,onDone)',
     'function transcribe_file_btn()',
@@ -114,7 +112,7 @@ def patch_source(source: str, extension: str) -> tuple[str, int]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Patch the reviewed official KoboldAI Lite LITEVER 353 for Android with an optional OpenAI-compatible ASR provider for Android/desktop."
+        description="Patch the reviewed official KoboldAI Lite LITEVER 341 with KoboldCpp, GigaSTT and native Android on-device ASR."
     )
     parser.add_argument("index_html", type=Path, help="Path to the official Lite index.html")
     parser.add_argument(
@@ -167,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("Original HTML was not modified.")
     print("The original init() is called after the separate ASR profile load; startup falls back to init() if profile loading fails.")
-    print("Open the patched HTML, then configure Settings > Media > Audio Input > ASR Provider.")
+    print("Configure Settings > Media > Audio Input > ASR Provider: KoboldCpp Whisper, GigaSTT or Android On-device ASR.")
     return 0
 
 

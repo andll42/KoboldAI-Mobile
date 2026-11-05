@@ -1,0 +1,440 @@
+package __PACKAGE__;
+
+import android.Manifest;
+import android.content.Intent;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.speech.RecognitionListener;
+import android.speech.RecognitionSupport;
+import android.speech.RecognitionSupportCallback;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.os.Bundle;
+
+import com.getcapacitor.JSObject;
+import com.getcapacitor.Plugin;
+import com.getcapacitor.PluginCall;
+import com.getcapacitor.PermissionState;
+import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
+
+import org.json.JSONArray;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+
+/**
+ * Strict on-device Android speech recognition bridge.
+ * It only creates SpeechRecognizer.createOnDeviceSpeechRecognizer(); it never
+ * falls back to the network/default recognizer.
+ */
+@CapacitorPlugin(
+    name = "AndroidSpeech",
+    permissions = {
+        @Permission(alias = "microphone", strings = { Manifest.permission.RECORD_AUDIO })
+    }
+)
+public class AndroidSpeechPlugin extends Plugin {
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private SpeechRecognizer recognizer;
+    private boolean continuous = false;
+    private boolean stopRequested = false;
+    private boolean isListening = false;
+    private String activeLanguage = "ru-RU";
+    private long sessionNumber = 0;
+
+    @PluginMethod
+    public void getStatus(PluginCall call) {
+        JSObject result = new JSObject();
+        int sdk = Build.VERSION.SDK_INT;
+        boolean onDeviceAvailable = sdk >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(getContext());
+        result.put("sdkInt", sdk);
+        result.put("onDeviceAvailable", onDeviceAvailable);
+        result.put("supportQueryAvailable", sdk >= 33);
+        result.put("microphonePermission", getPermissionState("microphone").toString());
+        result.put("strictOnDevice", true);
+        call.resolve(result);
+    }
+
+    @PluginMethod
+    public void requestMicrophonePermission(PluginCall call) {
+        if (getPermissionState("microphone") == PermissionState.GRANTED) {
+            JSObject result = new JSObject();
+            result.put("granted", true);
+            call.resolve(result);
+            return;
+        }
+        requestPermissionForAlias("microphone", call, "microphonePermissionResult");
+    }
+
+    @PermissionCallback
+    private void microphonePermissionResult(PluginCall call) {
+        boolean granted = getPermissionState("microphone") == PermissionState.GRANTED;
+        if (!granted) {
+            call.reject("Microphone permission was not granted. Enable it in Android Settings → Apps → KoboldAI Mobile → Permissions.");
+            return;
+        }
+        JSObject result = new JSObject();
+        result.put("granted", true);
+        call.resolve(result);
+    }
+
+    @PluginMethod
+    public void checkLanguageSupport(PluginCall call) {
+        String language = normalizeLanguage(call.getString("language", "ru-RU"));
+        if (Build.VERSION.SDK_INT < 31 || !SpeechRecognizer.isOnDeviceRecognitionAvailable(getContext())) {
+            JSObject result = new JSObject();
+            result.put("supportQueryAvailable", Build.VERSION.SDK_INT >= 33);
+            result.put("onDeviceAvailable", false);
+            result.put("language", language);
+            call.resolve(result);
+            return;
+        }
+        if (Build.VERSION.SDK_INT < 33) {
+            JSObject result = new JSObject();
+            result.put("supportQueryAvailable", false);
+            result.put("onDeviceAvailable", true);
+            result.put("language", language);
+            result.put("languageStatus", "unknown");
+            result.put("message", "Android 12 does not expose the installed on-device language list. The requested locale will be verified when recognition starts.");
+            call.resolve(result);
+            return;
+        }
+
+        mainHandler.post(() -> {
+            SpeechRecognizer probe = null;
+            try {
+                probe = SpeechRecognizer.createOnDeviceSpeechRecognizer(getContext());
+                SpeechRecognizer finalProbe = probe;
+                probe.checkRecognitionSupport(
+                    buildRecognizerIntent(language),
+                    getContext().getMainExecutor(),
+                    new RecognitionSupportCallback() {
+                        @Override
+                        public void onSupportResult(RecognitionSupport support) {
+                            try {
+                                List<String> installed = support.getInstalledOnDeviceLanguages();
+                                List<String> supported = support.getSupportedOnDeviceLanguages();
+                                List<String> pending = support.getPendingOnDeviceLanguages();
+                                String state = containsLanguage(installed, language) ? "installed"
+                                    : containsLanguage(pending, language) ? "pending"
+                                    : containsLanguage(supported, language) ? "downloadable"
+                                    : "unsupported";
+                                JSObject result = new JSObject();
+                                result.put("supportQueryAvailable", true);
+                                result.put("onDeviceAvailable", true);
+                                result.put("language", language);
+                                result.put("languageStatus", state);
+                                result.put("installedOnDeviceLanguages", new JSONArray(installed));
+                                result.put("supportedOnDeviceLanguages", new JSONArray(supported));
+                                result.put("pendingOnDeviceLanguages", new JSONArray(pending));
+                                // createOnDeviceSpeechRecognizer is expected to return no online languages.
+                                result.put("onlineLanguages", new JSONArray(support.getOnlineLanguages()));
+                                call.resolve(result);
+                            } catch (Exception error) {
+                                call.reject("Could not read Android on-device language support: " + error.getMessage());
+                            } finally {
+                                finalProbe.destroy();
+                            }
+                        }
+
+                        @Override
+                        public void onError(int error) {
+                            finalProbe.destroy();
+                            JSObject result = new JSObject();
+                            result.put("supportQueryAvailable", false);
+                            result.put("onDeviceAvailable", true);
+                            result.put("language", language);
+                            result.put("languageStatus", "unknown");
+                            result.put("supportErrorCode", error);
+                            result.put("message", "The Android speech service cannot enumerate language packs. The actual offline locale will be checked when listening starts.");
+                            call.resolve(result);
+                        }
+                    }
+                );
+            } catch (Exception error) {
+                if (probe != null) probe.destroy();
+                call.reject("Could not query on-device speech support: " + error.getMessage());
+            }
+        });
+    }
+
+    /** Explicit user action only. This may ask Android to download a speech model. */
+    @PluginMethod
+    public void requestLanguageModelDownload(PluginCall call) {
+        if (Build.VERSION.SDK_INT < 33) {
+            call.reject("Android language-model download API requires Android 13 (API 33) or newer.");
+            return;
+        }
+        String language = normalizeLanguage(call.getString("language", "ru-RU"));
+        if (!SpeechRecognizer.isOnDeviceRecognitionAvailable(getContext())) {
+            call.reject("No on-device speech recognition service is available on this device.");
+            return;
+        }
+        mainHandler.post(() -> {
+            SpeechRecognizer probe = null;
+            try {
+                probe = SpeechRecognizer.createOnDeviceSpeechRecognizer(getContext());
+                probe.triggerModelDownload(buildRecognizerIntent(language));
+                probe.destroy();
+                JSObject result = new JSObject();
+                result.put("requested", true);
+                result.put("language", language);
+                result.put("message", "Android was asked to prepare the on-device language model. This action may require a network connection or Android confirmation. Check language support again afterward.");
+                call.resolve(result);
+            } catch (Exception error) {
+                if (probe != null) probe.destroy();
+                call.reject("Could not request the Android language model: " + error.getMessage());
+            }
+        });
+    }
+
+    @PluginMethod
+    public void startListening(PluginCall call) {
+        if (Build.VERSION.SDK_INT < 31 || !SpeechRecognizer.isOnDeviceRecognitionAvailable(getContext())) {
+            call.reject("Android on-device SpeechRecognizer is unavailable. No network recognizer fallback is used.");
+            return;
+        }
+        if (getPermissionState("microphone") != PermissionState.GRANTED) {
+            call.reject("Microphone permission is missing. Call requestMicrophonePermission first.");
+            return;
+        }
+
+        final String language = normalizeLanguage(call.getString("language", "ru-RU"));
+        final boolean keepListening = Boolean.TRUE.equals(call.getBoolean("continuous", false));
+        mainHandler.post(() -> {
+            try {
+                stopRequested = false;
+                continuous = keepListening;
+                activeLanguage = language;
+                sessionNumber++;
+                destroyRecognizer();
+                recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(getContext());
+                recognizer.setRecognitionListener(createRecognitionListener(sessionNumber));
+                recognizer.startListening(buildRecognizerIntent(activeLanguage));
+                isListening = true;
+                JSObject result = new JSObject();
+                result.put("started", true);
+                result.put("continuous", continuous);
+                result.put("language", activeLanguage);
+                result.put("strictOnDevice", true);
+                call.resolve(result);
+            } catch (Exception error) {
+                continuous = false;
+                stopRequested = true;
+                isListening = false;
+                destroyRecognizer();
+                call.reject("Could not start Android on-device recognition: " + error.getMessage());
+            }
+        });
+    }
+
+    @PluginMethod
+    public void stopListening(PluginCall call) {
+        mainHandler.post(() -> {
+            continuous = false;
+            stopRequested = true;
+            if (recognizer == null) {
+                emitStopped("stopped");
+                call.resolve();
+                return;
+            }
+            if (!isListening) {
+                // A continuous session may be between recognition rounds. Destroy it
+                // now so its queued auto-restart cannot reopen the microphone.
+                emitStopped("stopped");
+                destroyRecognizer();
+                call.resolve();
+                return;
+            }
+            try {
+                recognizer.stopListening();
+                call.resolve();
+            } catch (Exception error) {
+                try { recognizer.cancel(); } catch (Exception ignored) { }
+                isListening = false;
+                emitStopped("cancelled");
+                call.resolve();
+            }
+        });
+    }
+
+    @PluginMethod
+    public void cancelListening(PluginCall call) {
+        mainHandler.post(() -> {
+            continuous = false;
+            stopRequested = true;
+            if (recognizer != null) {
+                try { recognizer.cancel(); } catch (Exception ignored) { }
+            }
+            isListening = false;
+            emitStopped("cancelled");
+            destroyRecognizer();
+            call.resolve();
+        });
+    }
+
+    private RecognitionListener createRecognitionListener(long session) {
+        return new RecognitionListener() {
+            @Override public void onReadyForSpeech(Bundle params) {
+                if (session != sessionNumber) return;
+                isListening = true;
+                JSObject event = new JSObject();
+                event.put("language", activeLanguage);
+                event.put("continuous", continuous);
+                notifyListeners("listening", event);
+            }
+            @Override public void onBeginningOfSpeech() {
+                if (session != sessionNumber) return;
+                notifyListeners("speechStart", new JSObject());
+            }
+            @Override public void onRmsChanged(float rmsdB) {
+                // No high-frequency RMS events are forwarded to JS.
+            }
+            @Override public void onBufferReceived(byte[] buffer) { }
+            @Override public void onEndOfSpeech() {
+                if (session != sessionNumber) return;
+                notifyListeners("speechEnd", new JSObject());
+            }
+            @Override public void onError(int error) {
+                if (session != sessionNumber) return;
+                isListening = false;
+                if (continuous && !stopRequested && isRecoverable(error)) {
+                    JSObject retry = new JSObject();
+                    retry.put("code", error);
+                    retry.put("message", errorMessage(error));
+                    notifyListeners("retry", retry);
+                    scheduleRestart(session, error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ? 850 : 500);
+                    return;
+                }
+                continuous = false;
+                JSObject event = new JSObject();
+                event.put("code", error);
+                event.put("message", errorMessage(error));
+                event.put("language", activeLanguage);
+                notifyListeners("error", event);
+                emitStopped("error");
+                destroyRecognizer();
+            }
+            @Override public void onResults(Bundle results) {
+                if (session != sessionNumber) return;
+                ArrayList<String> matches = results == null ? null : results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                String text = matches != null && !matches.isEmpty() ? matches.get(0) : "";
+                JSObject event = new JSObject();
+                event.put("text", text == null ? "" : text.trim());
+                event.put("language", activeLanguage);
+                event.put("strictOnDevice", true);
+                notifyListeners("result", event);
+                isListening = false;
+                if (continuous && !stopRequested) {
+                    scheduleRestart(session, 450);
+                } else {
+                    continuous = false;
+                    emitStopped("complete");
+                    destroyRecognizer();
+                }
+            }
+            @Override public void onPartialResults(Bundle partialResults) {
+                if (session != sessionNumber || partialResults == null) return;
+                ArrayList<String> matches = partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                if (matches == null || matches.isEmpty()) return;
+                JSObject event = new JSObject();
+                event.put("text", matches.get(0));
+                notifyListeners("partial", event);
+            }
+            @Override public void onEvent(int eventType, Bundle params) { }
+        };
+    }
+
+    private void scheduleRestart(long session, long delayMs) {
+        mainHandler.postDelayed(() -> {
+            if (session != sessionNumber || !continuous || stopRequested || recognizer == null) return;
+            try {
+                recognizer.startListening(buildRecognizerIntent(activeLanguage));
+                isListening = true;
+            } catch (Exception error) {
+                continuous = false;
+                isListening = false;
+                JSObject event = new JSObject();
+                event.put("code", -1);
+                event.put("message", "Could not restart on-device recognition: " + error.getMessage());
+                notifyListeners("error", event);
+                emitStopped("error");
+                destroyRecognizer();
+            }
+        }, delayMs);
+    }
+
+    private Intent buildRecognizerIntent(String language) {
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, language);
+        intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
+        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getContext().getPackageName());
+        return intent;
+    }
+
+    private void emitStopped(String reason) {
+        JSObject event = new JSObject();
+        event.put("reason", reason);
+        event.put("language", activeLanguage);
+        notifyListeners("stopped", event);
+    }
+
+    private void destroyRecognizer() {
+        if (recognizer != null) {
+            try { recognizer.cancel(); } catch (Exception ignored) { }
+            try { recognizer.destroy(); } catch (Exception ignored) { }
+            recognizer = null;
+        }
+        isListening = false;
+    }
+
+    private static boolean isRecoverable(int error) {
+        return error == SpeechRecognizer.ERROR_NO_MATCH
+            || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+            || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY;
+    }
+
+    private static String errorMessage(int error) {
+        switch (error) {
+            case SpeechRecognizer.ERROR_AUDIO: return "Android microphone audio error.";
+            case SpeechRecognizer.ERROR_CLIENT: return "Android speech recognizer client error.";
+            case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS: return "Android microphone permission is missing.";
+            case SpeechRecognizer.ERROR_NETWORK: return "The on-device speech service reported a network-related error. The app did not switch to the network recognizer.";
+            case SpeechRecognizer.ERROR_NETWORK_TIMEOUT: return "The on-device speech service reported a timeout. No network recognizer fallback was used.";
+            case SpeechRecognizer.ERROR_NO_MATCH: return "No speech was recognized.";
+            case SpeechRecognizer.ERROR_RECOGNIZER_BUSY: return "The Android speech recognizer is busy.";
+            case SpeechRecognizer.ERROR_SERVER: return "The Android speech service returned an internal error.";
+            case SpeechRecognizer.ERROR_SERVER_DISCONNECTED: return "The Android speech service disconnected.";
+            case SpeechRecognizer.ERROR_SPEECH_TIMEOUT: return "No speech was detected before timeout.";
+            case SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED: return "The selected language is not supported by the on-device recognizer. Check the installed Russian language model.";
+            case SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE: return "The selected language model is supported but not installed or not available yet.";
+            default: return "Android speech recognition failed (error " + error + ").";
+        }
+    }
+
+    private static String normalizeLanguage(String language) {
+        String value = (language == null || language.trim().isEmpty()) ? "ru-RU" : language.trim();
+        if (value.equalsIgnoreCase("ru") || value.equalsIgnoreCase("ru-ru")) return "ru-RU";
+        return value.replace('_', '-');
+    }
+
+    private static boolean containsLanguage(List<String> values, String requested) {
+        if (values == null) return false;
+        String wanted = requested.toLowerCase(Locale.ROOT);
+        String wantedBase = wanted.split("-")[0];
+        for (String value : values) {
+            if (value == null) continue;
+            String candidate = value.toLowerCase(Locale.ROOT);
+            if (candidate.equals(wanted) || candidate.equals(wantedBase) || candidate.startsWith(wantedBase + "-")) return true;
+        }
+        return false;
+    }
+}

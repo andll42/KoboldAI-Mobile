@@ -1,16 +1,17 @@
 {
   "name": "koboldai-mobile-android",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
-  "description": "Android WebView shell for official KoboldAI Lite with built-in KoboldCpp ASR and GigaSTT external ASR.",
+  "description": "Android KoboldAI Lite shell with built-in KoboldCpp Whisper, GigaSTT and strict native Android on-device ASR.",
   "license": "AGPL-3.0-only",
   "engines": {
     "node": ">=22.0.0"
   },
   "scripts": {
+    "build:native-bridge": "node scripts/build_native_bridge.mjs",
     "prepare:lite": "python scripts/prepare_lite.py",
     "test:source": "python -m unittest discover -s tests -v",
-    "check:js": "node --check patch/kobold_lite_external_asr_mobile.js",
+    "check:js": "node --check patch/kobold_lite_external_asr_mobile.js && node --check src/android-speech-bridge.mjs",
     "android:add": "cap add android",
     "android:sync": "cap sync android",
     "android:open": "cap open android"
@@ -20,6 +21,7 @@
     "@capacitor/core": "8.6.0"
   },
   "devDependencies": {
-    "@capacitor/cli": "8.6.0"
+    "@capacitor/cli": "8.6.0",
+    "esbuild": "0.28.2"
   }
 }

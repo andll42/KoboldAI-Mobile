@@ -1,187 +1,111 @@
 # KoboldAI Mobile (Android) — исходный проект
 
-Android-оболочка Capacitor для **официального KoboldAI Lite** с сохранением штатного интерфейса и аудио-потоков Lite. Внешнее распознавание добавлено как дополнительный провайдер GigaSTT; встроенный KoboldCpp Whisper остаётся доступен.
+Android-приложение на Capacitor поверх **официального KoboldAI Lite**. В меню `Settings → Media → Audio Input → ASR Provider` доступны три независимых провайдера:
 
-> **Статус комплекта:** это исходный проект и воспроизводимый Windows build-скрипт. Готовый APK в текущей среде не собран: здесь нет Android SDK / Android Studio и Gradle wrapper. APK создаётся на Windows-компьютере командой `build-android.bat`. Не выдаём исходный проект за проверенный APK.
+1. **Built-in KoboldCpp Whisper** — штатная транскрибация на компьютере через KoboldCpp.
+2. **GigaSTT / OpenAI-compatible ASR** — внешний ASR на компьютере по Wi-Fi (`POST /v1/audio/transcriptions`).
+3. **Android On-device ASR** — нативный `SpeechRecognizer.createOnDeviceSpeechRecognizer()` непосредственно на телефоне. Используется системная служба Android (например, Speech Services by Google, если она является on-device провайдером на устройстве). Сетевой распознаватель как резервный вариант не создаётся.
+
+> **Состояние:** это исходный проект и reproducible build scripts. APK в этой среде не собран и на POCO M5s не проверен: отсутствуют Android SDK/Gradle и физическое устройство. Проектные тесты не являются подтверждением работы микрофона/русской модели на телефоне.
 
 ## Архитектура
 
-- В APK локально упаковывается HTML официального KoboldAI Lite, который скачивается из официального репозитория во время сборки.
-- Скрипт `scripts/prepare_lite.py` проверяет `LITEVER 353` и полный набор якорей штатных функций. Если upstream изменился, сборка останавливается вместо рискованной подмены не той версии.
-- `patch/kobold_lite_external_asr_mobile.js` инъектируется в официальный `pwa-setup` до `init()`.
-- `Built-in KoboldCpp` продолжает вызывать штатный `/api/extra/transcribe` с исходным JSON-контрактом.
-- `Custom OpenAI-compatible ASR` отправляет WAV `multipart/form-data` на настраиваемый маршрут, для GigaSTT — `POST /v1/audio/transcriptions`.
-- Запись, VAD, `MediaRecorder`, ресемплинг WAV 16 kHz, Detect Voice, Push-To-Talk, Toggle-To-Talk, отправка распознанного текста в `prepare_submit_generation()` и существующий TTS не переписываются.
-- `CapacitorHttp` отключён: оставляем стандартный WebView `fetch`/XHR, чтобы не вмешиваться в существующие потоковые ответы LLM.
+- В APK упаковывается HTML официального KoboldAI Lite, скачиваемый из `LostRuins/lite.koboldai.net` во время сборки.
+- `scripts/prepare_lite.py` требует структуру `LITEVER 341` и точные upstream-якоря. Доступный при проверке публичный raw-снимок показывал 341, но веб-индекс помечал его как не совсем свежий; поэтому сборка заново скачивает upstream и прекращает работу, если live-файл уже другой. При изменении Lite нужна повторная проверка и обновление патчера.
+- `patch/kobold_lite_external_asr_mobile.js` добавляет меню из трёх ASR-провайдеров, GigaSTT multipart-адаптер и интеграцию с Android-мостом.
+- Built-in KoboldCpp Whisper сохраняет штатный `POST /api/extra/transcribe` и исходный цикл `MediaRecorder → VAD → WAV 16 kHz`.
+- GigaSTT сохраняет штатный веб-цикл записи Lite и отправляет WAV через `multipart/form-data` в настраиваемый endpoint.
+- Android ASR использует отдельный Capacitor-плагин `native/android/AndroidSpeechPlugin.java.template`. Он захватывает микрофон через `SpeechRecognizer.createOnDeviceSpeechRecognizer()`; браузерный `MediaRecorder` при этом не запускается. Он не использует обычный `createSpeechRecognizer()` и не переключается на online recognizer.
+- Android plugin проверяет доступность on-device SpeechRecognizer. На Android 13+ дополнительно запрашивает список установленных/поддерживаемых offline языков; при необходимости пользователь вручную нажимает `Download language model`. На Android 12 список может быть недоступен — тогда фактическая поддержка `ru-RU` проверяется при старте.
+- `CapacitorHttp` выключен: штатный WebView `fetch`/XHR остаётся для потоковой генерации LLM и GigaSTT.
+
+## Поведение режимов записи
+
+Для KoboldCpp Whisper и GigaSTT остаются оригинальные Detect Voice, Push-To-Talk и Toggle-To-Talk KoboldAI Lite.
+
+Для Android On-device ASR используются те же команды интерфейса, но микрофон контролирует нативный Android распознаватель:
+
+- **Detect Voice:** Android сам определяет начало/конец фразы; законченная фраза отправляется в Lite. На время генерации прослушивание приостанавливается, затем возобновляется, когда Lite снова разрешает ввод.
+- **Push-To-Talk:** нажатие/удержание запускает повторяющиеся нативные фразовые сессии; Android может возвращать несколько фразовых результатов внутри удержания. Отпускание останавливает распознаватель, объединяет накопленные фрагменты и отправляет их одним сообщением.
+- **Toggle-To-Talk:** первое нажатие запускает повторяющиеся системные распознавания фраз, второе останавливает прослушивание; распознанные фрагменты объединяются и отправляются одним сообщением.
+
+Android `SpeechRecognizer` сам определяет конец фразы; это не тот же VAD, который используется настольными провайдерами. Он не предназначен для бесконечного непрерывного аудиопотока, поэтому Android-режим реализован как повторяющиеся короткие сессии фраз.
+
+## Требования к телефону
+
+- Android 12 (API 31) или новее и доступная системная on-device SpeechRecognitionService.
+- Разрешение Android на `RECORD_AUDIO`.
+- Локальный пакет распознавания `ru-RU` в системной службе. Наличие голосового ввода Gboard само по себе **не гарантирует**, что у системного on-device `SpeechRecognizer` есть офлайн-пакет русского языка.
+- Android 13+ (API 33+) предоставляет API для проверки установленных/загружаемых on-device языковых моделей. Кнопка загрузки вызывает системный запрос модели; сам запрос может требовать интернет/подтверждение Android, но аудио в этом действии не отправляется. После загрузки нажмите `Check device support`.
+- Если on-device служба/язык недоступны, приложение сообщает об этом и не делает сетевой fallback. Можно выбрать GigaSTT или KoboldCpp Whisper.
 
 ## Требования для сборки Windows
 
-1. **Node.js 22 или новее** и npm.
-2. **Python 3.10+**.
-3. **Android Studio 2025.2.1 или новее**, Android SDK (платформа API 36 рекомендуется). Android Studio устанавливает подходящий JDK.
-4. Интернет при первой сборке: npm-пакеты и чистый официальный `index.html` загружаются из официальных источников.
+1. Node.js 22+ и npm.
+2. Python 3.10+.
+3. Android Studio 2025.2.1+ с Android SDK Platform 36 и Build Tools 36.0.0.
+4. Интернет при первой сборке: npm-пакеты и чистый HTML Lite загружаются из официальных источников.
 
-Официальные требования Capacitor 8: https://capacitorjs.com/docs/getting-started/environment-setup
+Capacitor закреплён на 8.6.0. Требования: https://capacitorjs.com/docs/getting-started/environment-setup
 
-## Сборка APK в облаке GitHub Actions (без Android Studio на домашнем ПК)
+## Сборка APK на домашнем ПК
 
-Если не хочется устанавливать Android Studio, Android SDK, Node.js, Python и Gradle, используйте отдельную ветку `mobile/android-apk` и workflow `.github/workflows/build-android-apk.yml`. GitHub Actions выполняет сборку на временном Ubuntu runner и прикладывает `app-debug.apk` как artifact. На домашнем ПК достаточно Git for Windows или GitHub Desktop и браузера. Пошаговая инструкция: [`CLOUD_BUILD_RU.md`](CLOUD_BUILD_RU.md).
-
-Пока ветка не отправлена в ваш GitHub-репозиторий и workflow не завершился успешно, готового APK нет.
-
-## Сборка APK
-
-1. Распакуйте архив в папку, например `D:\KoboldAI-Mobile`.
-2. Установите Android Studio и через **Tools → SDK Manager** поставьте Android SDK Platform 36 и Android SDK Build-Tools.
-3. Откройте CMD в корне распакованного проекта.
+1. Распакуйте архив, например, в `D:\KoboldAI-Mobile`.
+2. Установите Android Studio и Android SDK Platform 36 / Build Tools 36.0.0.
+3. Откройте CMD в корне проекта.
 4. Выполните:
 
 ```bat
 build-android.bat
 ```
 
-Скрипт:
+Скрипт установит закреплённые JS-зависимости, выполнит тесты, соберёт JS-мост через esbuild, скачает/проверит Lite LITEVER 341, добавит Android-плагин и разрешения, синхронизирует Capacitor и запустит Gradle.
 
-- установит закреплённые версии Capacitor 8.6.0;
-- выполнит Python/JS тесты;
-- скачает чистый официальный Lite и проверит LITEVER + якоря;
-- создаст платформу Android (`npx cap add android` при первом запуске);
-- добавит `INTERNET`, `ACCESS_NETWORK_STATE`, `RECORD_AUDIO`, `MODIFY_AUDIO_SETTINGS`;
-- включит локальный HTTP для адресов backend в доверенной Wi-Fi сети;
-- выполнит `npx cap sync android` и `gradlew assembleDebug`.
-
-Готовый debug APK:
+APK после успешной сборки:
 
 ```text
 android\app\build\outputs\apk\debug\app-debug.apk
 ```
 
-Скопируйте APK на Android, разрешите установку приложения из выбранного файлового менеджера и установите. Это **debug APK**, он не подписан вашим release-ключом и предназначен для личной установки/тестирования. Для публикации нужен отдельный release signing и проверка политик магазина.
+Это debug APK для личной установки/тестирования. Для release/Play Store потребуется отдельная подпись и проверка требований магазина.
 
-### Сборка вручную / открытие Android Studio
+## Сборка в GitHub Actions (без Android Studio на ПК)
 
-После выполнения `build-android.bat` можно открыть `android` в Android Studio. Для обновления web-ресурсов повторите:
+Ветка проекта — `mobile/android-apk`; workflow `.github/workflows/build-android-apk.yml` собирает debug APK на временном runner и публикует Actions Artifact. Пошагово: [`CLOUD_BUILD_RU.md`](CLOUD_BUILD_RU.md).
 
-```bat
-python -m unittest discover -s tests -v
-node --check patch\kobold_lite_external_asr_mobile.js
-python scripts\prepare_lite.py
-python scripts\patch_android_manifest.py
-npx cap sync android
-```
+Workflow ещё должен быть отправлен в ваш GitHub-репозиторий и успешно выполнен. Пока этого не произошло, готового APK нет.
 
-Затем в Android Studio выполните **Build → Build Bundle(s) / APK(s) → Build APK(s)** либо из `android` запустите `gradlew.bat assembleDebug`.
+## LAN-настройка (телефон ↔ ПК)
 
-## Настройка локальной сети (телефон ↔ ПК)
+Телефон и ПК должны быть в одной доверенной Wi-Fi сети. `127.0.0.1` на телефоне — сам телефон, не ПК. Используйте IPv4 компьютера из `ipconfig`.
 
-Телефон и ПК должны находиться в одной доверенной Wi-Fi сети. `127.0.0.1` на телефоне указывает на сам телефон, а не на ПК.
+- KoboldCpp: например `http://192.168.1.105:5001`.
+- GigaSTT: например `http://192.168.1.105:9876/v1` и endpoint `/audio/transcriptions`.
+- GigaSTT должен слушать LAN-интерфейс (`--bind-all`) и разрешать origin `https://localhost` (`--allow-origin https://localhost`). Не используйте wildcard `--cors-allow-any`.
+- Windows Firewall должен разрешать эти TCP-порты только из домашней/доверенной подсети. Не пробрасывайте порты KoboldCpp/GigaSTT в интернет.
 
-### 1. Узнайте IP компьютера
+Для мобильного WebView включён HTTP/mixed content, чтобы приложение могло обращаться к заданным локальным HTTP-серверам. Это снижает сетевую защиту приложения; используйте только доверенную LAN. См. [`docs/LAN_SECURITY.md`](docs/LAN_SECURITY.md).
 
-На ПК:
+## Ручные тесты после установки APK
 
-```bat
-ipconfig
-```
+1. **Built-in Whisper:** выбрать Built-in KoboldCpp Whisper, убедиться, что у KoboldCpp загружен Whisper, проверить короткую русскую фразу во всех трёх режимах.
+2. **GigaSTT:** выбрать GigaSTT, ввести LAN IP ПК, проверить `Test connection` (`GET /models`) и `Check GigaSTT readiness` (`GET /ready`), затем отдельно произнести тестовую фразу в каждом режиме. GET-проверки не включают микрофон и не отправляют аудио.
+3. **Android ASR:** выбрать Android On-device ASR, язык `Russian (ru-RU)`, нажать `Check device support`. На Android 13+ при `downloadable` явно нажать `Download language model`, дождаться установки и проверить поддержку повторно. Затем провести отдельные тесты Detect / PTT / Toggle.
+4. **Отсутствие offline модели:** проверить, что приложение сообщает об ошибке и не переключается на сетевой распознаватель.
+5. **LLM/TTS:** проверить отправку текста, streaming generation и штатный TTS после каждого провайдера.
+6. **Отказ доступа:** запретить разрешение микрофона Android, проверить ясное сообщение; затем разрешить и повторить.
+7. **LAN:** выключить GigaSTT или KoboldCpp и проверить понятные ошибки подключения. Убедиться, что локальный Android ASR продолжает работать без этих серверов (при наличии offline-модели).
 
-Найдите IPv4 Wi-Fi, например `192.168.1.105`. Далее вместо этого примера используйте свой адрес. Желательно закрепить IP в настройках роутера (DHCP reservation), чтобы он не менялся.
+## Проверки, выполненные при подготовке исходников
 
-### 2. Настройте KoboldCpp
+- `python -m unittest discover -s tests -v`: 24 теста пройдены.
+- `node --check patch/kobold_lite_external_asr_mobile.js`: пройдено.
+- `node --check src/android-speech-bridge.mjs`: пройдено.
+- `python -m py_compile scripts/*.py tests/*.py`: пройдено.
+- Проверены синтетические примеры регистрации Capacitor plugin в MainActivity и идемпотентности правки AndroidManifest.
 
-Запустите KoboldCpp так, чтобы он принимал подключения из LAN (не только loopback). Типичная настройка — bind/listen на `0.0.0.0`, порт обычно `5001`.
+Не выполнялись: npm install/esbuild bundle, загрузка upstream HTML, `npx cap add/sync`, Gradle assembleDebug, тесты на эмуляторе/POCO M5s, реальные сетевые ASR-запросы и проверка микрофона. В среде подготовки нет Android SDK/Gradle и доступа к физическому устройству.
 
-Разрешите входящий TCP-порт KoboldCpp в Windows Firewall **только для Private network**. В Lite укажите обычный KoboldCpp API endpoint:
+## Лицензия
 
-```text
-http://192.168.1.105:5001
-```
-
-Встроенный ASR при этом остаётся на стороне KoboldCpp и требует загруженную/поддерживаемую Whisper-модель. Если внешний GigaSTT выбран, Whisper в KoboldCpp не требуется.
-
-### 3. Настройте GigaSTT для Wi-Fi
-
-Официальный GigaSTT по умолчанию слушает `127.0.0.1`; для удалённого телефона нужно явно разрешить bind на LAN. Запустите сервер на ПК (или используйте `start_gigastt_lan.bat` после активации среды GigaSTT):
-
-```bat
-gigastt serve --host 0.0.0.0 --port 9876 --bind-all --allow-origin https://localhost
-```
-
-`--bind-all` нужен, чтобы GigaSTT слушал не только loopback. `--allow-origin https://localhost` разрешает origin локального Capacitor-приложения. **Не добавляйте `--cors-allow-any`**. Разрешите входящий TCP-порт `9876` в Windows Firewall только для Private network и локальной подсети. В PowerShell от администратора (при необходимости):
-
-```powershell
-New-NetFirewallRule -DisplayName "GigaSTT LAN 9876" -Direction Inbound -Protocol TCP -LocalPort 9876 -Action Allow -Profile Private -RemoteAddress LocalSubnet
-New-NetFirewallRule -DisplayName "KoboldCpp LAN 5001" -Direction Inbound -Protocol TCP -LocalPort 5001 -Action Allow -Profile Private -RemoteAddress LocalSubnet
-```
-
-Если CLI вашей установленной сборки GigaSTT отличается, сверяйтесь с `gigastt serve --help` и документацией именно этой версии.
-
-### 4. Настройте ASR в KoboldAI Lite внутри APK
-
-Откройте **Settings → Media → Audio Input**:
-
-| Поле | Значение |
-|---|---|
-| ASR Provider | `Custom OpenAI-compatible ASR` |
-| ASR Base URL | `http://192.168.1.105:9876/v1` |
-| ASR Endpoint Path | `/audio/transcriptions` |
-| ASR Model | `whisper-1` (GigaSTT принимает и игнорирует это имя) |
-| ASR API Key | пусто, если сервер не настроил собственную авторизацию |
-| Language | `ru` |
-| Extra multipart fields | пусто |
-
-GigaSTT использует загруженную при старте модельный вариант. `rnnt` по умолчанию предназначен для русского; `e2e_rnnt` даёт встроенную пунктуацию и регистр. Поле `language=ru` само по себе не переключает модельный вариант.
-
-Нажмите:
-
-- **Test connection** — GET `/v1/models`; только проверяет API endpoint, звука не отправляет.
-- **Check GigaSTT readiness** — GET `/ready`; проверяет, готов ли пул inference. Тоже не отправляет звук.
-
-Реальная проверка происходит только после сознательного включения Voice Input и записи речи: Lite отправит WAV на `POST /v1/audio/transcriptions`.
-
-## Микрофон и режимы записи
-
-При первом старте Android покажет системный запрос разрешения микрофона — разрешите его. Если отказали, откройте Android **Настройки → Приложения → KoboldAI Mobile → Разрешения → Микрофон**.
-
-В APK WebView использует локальный secure origin `https://localhost`; Capacitor Android WebChromeClient обрабатывает запросы веб-микрофона и разрешение `RECORD_AUDIO`. Это устраняет ограничение Firefox для `http://<LAN-IP>` на телефоне, но не отменяет системное разрешение Android.
-
-Штатные режимы Lite сохраняются:
-
-- Detect Voice — запись с VAD;
-- Push-To-Talk — запись пока удерживается действие;
-- Toggle-To-Talk — запись переключается нажатием.
-
-Внешний ASR не требует Whisper в KoboldCpp. При выборе Built-in KoboldCpp прежняя проверка Whisper остаётся включённой.
-
-## Безопасность — прочитать перед использованием
-
-- Это приложение предназначено для **личной доверенной Wi-Fi сети**. Не используйте его как публичный сервис.
-- Чтобы телефон мог обращаться к `http://<PC-IP>:5001` и `http://<PC-IP>:9876`, WebView и Android manifest разрешают cleartext HTTP и mixed content. Это осознанное упрощение для LAN, но оно не шифрует трафик и не ограничивает HTTP исключительно одним IP-адресом.
-- Не делайте port forwarding этих портов на роутере и не используйте открытые/гостевые Wi-Fi сети.
-- Ограничьте Windows Firewall Private profile и включите пароль/доступ-контроль KoboldCpp, если функция включена в вашей конфигурации.
-- GigaSTT обычно не требует API key. Если внешний сервер требует ключ, ключ остаётся в приложении/локальной базе Lite и может быть извлечён пользователем устройства. Это не секретное хранилище и не подходит для недоверенных клиентов.
-- Для использования через интернет или в недоверенной сети настройте TLS и серверный reverse proxy с аутентификацией; не используйте `--cors-allow-any`.
-- `CapacitorHttp` намеренно отключён, чтобы не подменять глобальные `fetch`/XHR и не менять потоковую генерацию Lite.
-
-## Проверка и известные ограничения
-
-Автоматические проверки проекта:
-
-```bat
-python -m unittest discover -s tests -v
-node --check patch\kobold_lite_external_asr_mobile.js
-```
-
-Они проверяют целостность патчера, ожидаемые upstream-якоря в synthetic fixture, конфигурацию и ключевые контракты кода. Они **не** заменяют сборку Android, тест на реальном телефоне, реальный GigaSTT inference или проверку Bluetooth/гарнитур.
-
-Известные ограничения текущего комплекта:
-
-1. Внешний GigaSTT должен быть запущен отдельно на ПК; он не встроен в APK и не переносится на телефон.
-2. На первом build нужен доступ к GitHub raw и npm registry. Версия Lite закреплена на `LITEVER 353`; при изменении upstream скрипт откажется патчить, пока якоря и адаптер не будут повторно проверены.
-3. Это debug APK. Release подпись/Play Store не настроены.
-4. Сетевой трафик LAN — обычный HTTP без TLS.
-5. Разрешение микрофона при первом запросе выдаёт Android. Приложение не может обойти системный диалог.
-6. GigaSTT endpoint `POST /v1/audio/transcriptions` возвращает JSON `{ "text": "..." }`; адаптер ожидает строковое поле `text`.
-
-## Лицензия и upstream
-
-KoboldAI Lite распространяется по AGPL-3.0. Этот проект инъектирует модификацию в web-ресурс Lite; если вы распространяете APK или производный бинарный продукт, соблюдайте применимые требования AGPL и предоставляйте соответствующий исходный код изменений. Capacitor распространяется по MIT.
+KoboldAI Lite распространяется по AGPL-3.0. При распространении APK/производного продукта соблюдайте требования лицензии и предоставляйте исходники соответствующих изменений. См. `SOURCES.md`.

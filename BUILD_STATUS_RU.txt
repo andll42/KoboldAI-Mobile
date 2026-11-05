@@ -1,34 +1,38 @@
-KoboldAI Mobile Android — результат подготовки
+KoboldAI Mobile Android — v0.2.1, три ASR-провайдера
 
-ГОТОВО:
-- Capacitor project scaffold (config/package/scripts)
-- Android microphone/network manifest patch script
-- Official Lite LITEVER 353 fail-closed patcher
-- Built-in KoboldCpp ASR preserved
-- GigaSTT OpenAI-compatible multipart adapter
-- GigaSTT /models connection check and /ready readiness check (GET only; no audio upload)
-- Windows build script build-android.bat
-- Documentation and tests
+РЕАЛИЗОВАНО В ИСХОДНИКАХ:
+- Capacitor Android shell для официального KoboldAI Lite, проверка LITEVER 341 и набора upstream-якорей (fail-closed; при несовпадении сборка остановится).
+- ASR Provider menu: Built-in KoboldCpp Whisper / GigaSTT / Android On-device ASR.
+- Built-in KoboldCpp Whisper сохраняет штатный /api/extra/transcribe.
+- GigaSTT использует multipart/form-data и настраиваемые base URL/endpoint/model/key/language.
+- Android native Capacitor plugin использует только SpeechRecognizer.createOnDeviceSpeechRecognizer().
+- Язык Android ASR по умолчанию ru-RU.
+- Проверка on-device службы; на API33+ запрос installed/supported/pending языковых моделей.
+- Явная кнопка request model download; модель не скачивается автоматически.
+- Нет online recognizer fallback.
+- Android live-mic path интегрирован с Detect Voice, Push-To-Talk и Toggle-To-Talk.
+- Android Detect Voice использует системное определение конца фразы; PTT и Toggle буферизуют фразы до отпускания/повторного нажатия и отправляют единый текст.
+- Android no-match/timeout/busy не отключает весь Voice Input.
+- Для Android ASR файл аудио не загружается: провайдер работает с live microphone.
+- GigaSTT /models и /ready checks — GET-only и не отправляют звук.
+- Workflow GitHub Actions и Windows build script обновлены.
 
-ПРОВЕРКИ, ВЫПОЛНЕННЫЕ В ЭТОЙ СРЕДЕ:
-- python -m unittest discover -s tests -v: 13 passed
-- node --check patch/kobold_lite_external_asr_mobile.js: passed
-- python -m py_compile scripts/*.py tests/*.py: passed
+ПРОВЕРКИ В ЭТОЙ СРЕДЕ:
+- python -m unittest discover -s tests -v: 24 tests passed.
+- node --check patch/kobold_lite_external_asr_mobile.js: passed.
+- node --check src/android-speech-bridge.mjs: passed.
+- python -m py_compile scripts/*.py tests/*.py: passed.
+- Синтетическая проверка MainActivity plugin registration и AndroidManifest patch: passed.
 
 НЕ ВЫПОЛНЕНО:
-- Не скачан сетевая командами файл upstream index.html в локальный каталог сборки.
-- Не запускался npx cap add/sync.
-- Не выполнялся Gradle assembleDebug.
-- Не собирался APK и не тестировался физический Android-телефон.
+- npm install и esbuild bundle.
+- Загрузка upstream Lite во время build.
+- npx cap add/sync.
+- Gradle assembleDebug / APK build.
+- Запуск на Android эмуляторе или POCO M5s.
+- Проверка реальной доступности offline ru-RU языковой модели в POCO M5s.
+- Проверка реального микрофона, GigaSTT/Whisper, LLM streaming и TTS на устройстве.
 
-Причина: в среде подготовки отсутствуют Android SDK / ANDROID_HOME / ANDROID_SDK_ROOT и Gradle. APK не приложен, чтобы не выдавать несобранный файл за рабочее приложение.
+Причина: в среде нет Android SDK/ANDROID_HOME/ANDROID_SDK_ROOT/Gradle и физического Android-устройства. Нельзя утверждать, что APK уже собран или мобильный ASR проверен на телефоне.
 
-Для получения APK на Windows: установите Node.js 22+, Python 3.10+, Android Studio 2025.2.1+ и Android SDK, затем запустите build-android.bat.
-Ожидаемый путь после успешной сборки:
-android\app\build\outputs\apk\debug\app-debug.apk
-
-
-Cloud build branch update (2026-11-05):
-- Added .github/workflows/build-android-apk.yml for branch mobile/android-apk.
-- The workflow builds a debug APK on GitHub-hosted Ubuntu runner and uploads an Actions artifact.
-- The workflow has not yet been executed in the user's GitHub repository; no built APK is included in this source bundle.
+Получение APK: отправить ветку mobile/android-apk в GitHub; дождаться успешного Actions workflow и скачать KoboldAI-Mobile-debug-apk artifact.

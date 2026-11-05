@@ -1,5 +1,5 @@
 node_modules/
-android/
+/android/
 www/index.html
 www/index.html.asr-patched.html
 *.apk
@@ -7,3 +7,4 @@ www/index.html.asr-patched.html
 .DS_Store
 __pycache__/
 *.py[cod]
+www/android-speech-bridge.js
