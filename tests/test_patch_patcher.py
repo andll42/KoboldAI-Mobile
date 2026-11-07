@@ -10,7 +10,7 @@ from apply_lite_patch import PATCH_MARKER, REQUIRED_ANCHORS, patch_source  # noq
 EXTENSION = (ROOT / "patch" / "kobold_lite_external_asr_mobile.js").read_text(encoding="utf-8")
 
 
-def fixture(version: int = 341) -> str:
+def fixture(version: int = 353) -> str:
     lines = [f"const LITEVER = {version};"]
     lines.extend(anchor for anchor in REQUIRED_ANCHORS if anchor != f"const LITEVER = {version};")
     # The source validator checks these anchors as real strings. The synthetic fixture
@@ -21,14 +21,14 @@ def fixture(version: int = 341) -> str:
 class PatcherTests(unittest.TestCase):
     def test_patch_inserts_mobile_extension_and_preserves_init(self):
         patched, version = patch_source(fixture(), EXTENSION)
-        self.assertEqual(version, 341)
+        self.assertEqual(version, 353)
         self.assertIn(PATCH_MARKER, patched)
         self.assertIn("load_kobold_lite_external_asr_settings", patched)
         self.assertIn(".then(() => init());", patched)
         self.assertNotIn("\ninit();\n</script>", patched)
 
     def test_refuses_unreviewed_upstream_version(self):
-        with self.assertRaisesRegex(ValueError, "targets LITEVER 341"):
+        with self.assertRaisesRegex(ValueError, "targets LITEVER 353"):
             patch_source(fixture(354), EXTENSION)
 
     def test_refuses_html_already_patched(self):
@@ -38,7 +38,7 @@ class PatcherTests(unittest.TestCase):
 
     def test_refuses_missing_anchor(self):
         with self.assertRaisesRegex(ValueError, "missing anchor"):
-            patch_source("<script id=\"pwa-setup\">const LITEVER = 341; init();</script>", EXTENSION)
+            patch_source("<script id=\"pwa-setup\">const LITEVER = 353; init();</script>", EXTENSION)
 
     def test_requires_exactly_one_pwa_script(self):
         with self.assertRaisesRegex(ValueError, "exactly one"):
