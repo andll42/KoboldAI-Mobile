@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the external ASR adapter to the reviewed official KoboldAI Lite LITEVER 353 for Android."""
+"""Apply the external ASR adapter to the reviewed official KoboldAI Lite LITEVER 354 for Android."""
 from __future__ import annotations
 
 import argparse
@@ -9,10 +9,10 @@ import sys
 from pathlib import Path
 
 PATCH_MARKER = "KOBOLD_LITE_EXTERNAL_ASR_PATCH v5-android-asr"
-EXPECTED_LITEVER = 353
+EXPECTED_LITEVER = 354
 
 REQUIRED_ANCHORS = (
-    'const LITEVER = 353;',
+    'const LITEVER = 354;',
     'const PROTECTED_FIELDS = {',
     'const defaultsettings = JSON.parse(JSON.stringify(localsettings));',
     'function indexeddb_save(objkey, objdatastr)',
@@ -112,7 +112,7 @@ def patch_source(source: str, extension: str) -> tuple[str, int]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Patch the reviewed official KoboldAI Lite LITEVER 353 with KoboldCpp, GigaSTT and native Android on-device ASR."
+        description="Patch the reviewed official KoboldAI Lite LITEVER 354 with KoboldCpp, GigaSTT and native Android on-device ASR."
     )
     parser.add_argument("index_html", type=Path, help="Path to the official Lite index.html")
     parser.add_argument(
