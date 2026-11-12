@@ -1123,9 +1123,10 @@
 })();
 
 /* KOBOLD_LITE_LIVE_NARRATION_PATCH v1.0.0
- * Adds opt-in sentence-level live narration while streamed LLM text is arriving.
+ * Adds sentence-level live narration while streamed LLM text is arriving.
  * Uses Lite's existing audio TTS providers and the existing chunked playback queue.
- * Safe fallback: hidden-thought, dialog-only and embedded narration modes keep upstream behavior.
+ * Thinking blocks are filtered from the live stream before text is queued for TTS.
+ * Dialog-only and embedded narration modes keep upstream behavior.
  */
 (function installKoboldLiteLiveNarration() {
     "use strict";
@@ -1145,7 +1146,7 @@
 
     localsettings.tts_live_narration = !!localsettings.tts_live_narration;
     defaultsettings.tts_live_narration = false;
-    // Keep this field in Lite's ordinary settings persistence so the user's choice survives app restarts.
+
     const state = {
         epoch: 0,
         active: false,
@@ -1153,6 +1154,7 @@
         finalized: false,
         sessionOpen: false,
         lastSnapshot: "",
+        lastRawSnapshot: "",
         carry: "",
         spokenSentences: [],
         requestEpoch: null,
@@ -1172,10 +1174,6 @@
         if (localsettings.narrate_only_dialog) {
             return "Live Narration is paused while Narrate only dialog is enabled, to preserve the original quote filtering.";
         }
-        if ((Number(localsettings.thinking_action) === 1 || Number(localsettings.thinking_action) === 2)
-            && typeof get_thinking_regex === "function" && get_thinking_regex() !== "") {
-            return "Live Narration is paused while hidden-thinking filtering is active, to prevent hidden text from being spoken.";
-        }
         if (Number(localsettings.narrate_targets || 0) === 0) {
             return "Narration is disabled for all turns.";
         }
@@ -1188,14 +1186,84 @@
             .trim();
     }
 
+    // Extract the literal opening and closing tags from Lite's active thinking regex.
+    // The reviewed Lite 354 expression has the form:
+    // <think>((?:(?!...).)*?)</think>
+    function getThinkingTagPair() {
+        const action = Number(localsettings.thinking_action);
+        if (action !== 1 && action !== 2) return null;
+        if (typeof get_thinking_regex !== "function") return { invalid: true };
+
+        const expression = String(get_thinking_regex() || "");
+        if (!expression) return { invalid: true };
+
+        const bodyStart = expression.indexOf("((");
+        const bodyEnd = expression.lastIndexOf("*?)");
+        if (bodyStart <= 0 || bodyEnd < bodyStart) return { invalid: true };
+
+        const startTag = expression.slice(0, bodyStart);
+        const endTag = expression.slice(bodyEnd + 3);
+        // The current Lite tags are literal HTML-like markers (e.g. <think>).</n        // Refuse unexpected regex structures rather than risk speaking hidden text.
+        if (!startTag || !endTag || startTag.length > 128 || endTag.length > 128 ||
+            /[\\()[\]{}|+?*]/.test(startTag) || /[\\()[\]{}|+?*]/.test(endTag)) {
+            return { invalid: true };
+        }
+        return { startTag, endTag };
+    }
+
+    function indexOfIgnoreCase(text, token, fromIndex) {
+        return text.toLowerCase().indexOf(token.toLowerCase(), fromIndex);
+    }
+
+    function partialTagPrefixLength(text, tag) {
+        const max = Math.min(text.length, tag.length - 1);
+        for (let n = max; n > 0; n--) {
+            if (text.slice(-n).toLowerCase() === tag.slice(0, n).toLowerCase()) return n;
+        }
+        return 0;
+    }
+
+    // Filter a cumulative stream. Any unfinished thinking block is hidden,
+    // including partial opening/closing tags split across stream updates.
+    function filterThinkingFromStream(input) {
+        const text = String(input || "");
+        const tags = getThinkingTagPair();
+        if (tags === null) return text;
+        // Fail closed if Lite's regex is not in the reviewed format.
+        if (tags.invalid) return "";
+
+        let cursor = 0;
+        let visible = "";
+        let insideThinking = false;
+
+        while (cursor < text.length) {
+            if (insideThinking) {
+                const stopAt = indexOfIgnoreCase(text, tags.endTag, cursor);
+                if (stopAt < 0) break;
+                cursor = stopAt + tags.endTag.length;
+                insideThinking = false;
+            } else {
+                const startAt = indexOfIgnoreCase(text, tags.startTag, cursor);
+                if (startAt < 0) {
+                    const rest = text.slice(cursor);
+                    const hold = partialTagPrefixLength(rest, tags.startTag);
+                    visible += rest.slice(0, rest.length - hold);
+                    break;
+                }
+                visible += text.slice(cursor, startAt);
+                cursor = startAt + tags.startTag.length;
+                insideThinking = true;
+            }
+        }
+        return visible;
+    }
+
     // Split only after sentence punctuation followed by whitespace. This avoids
-    // emitting a sentence merely because a partial token currently ends in '.'
-    // and preserves closing quotes/brackets with the sentence.
+    // emitting a sentence merely because a partial token currently ends in '.'.
     function takeCompleteSentences(input) {
         const text = String(input || "");
         const chunks = [];
         const boundary = /[.!?。！？…]+["'’”»)\]\}\]]*(?=\s)/gu;
-        // The boundary is immediately before whitespace; exact source slices are retained.
         let cursor = 0;
         let match;
         while ((match = boundary.exec(text)) !== null) {
@@ -1258,23 +1326,23 @@
         state.finalized = false;
         state.sessionOpen = false;
         state.lastSnapshot = "";
+        state.lastRawSnapshot = "";
         state.carry = "";
         state.spokenSentences = [];
-        // Do not clear requestEpoch here. If an older fetch is still in flight,
-        // its captured epoch must remain available to the output-queue guard.
+        // Keep requestEpoch until the outstanding request returns so its audio
+        // can be rejected by the queue guard if this generation was cancelled.
         if (clearQueues) clearLiveQueues(!!stopPlayback);
         installOutputQueueGuard();
     }
 
     function beginLiveSession() {
-        if (state.sessionOpen || state.finalized) {
-            resetLiveState(true, true);
-        }
+        if (state.sessionOpen || state.finalized) resetLiveState(true, true);
         state.active = true;
         state.finalizing = false;
         state.finalized = false;
         state.sessionOpen = true;
         state.lastSnapshot = "";
+        state.lastRawSnapshot = "";
         state.carry = "";
         state.spokenSentences = [];
         try { tts_queue_embed = false; } catch (_) {}
@@ -1285,9 +1353,7 @@
 
     function enqueueSentence(sentence) {
         let clean = String(sentence || "").trim();
-        if (typeof strip_tts_media_placeholders === "function") {
-            clean = strip_tts_media_placeholders(clean);
-        }
+        if (typeof strip_tts_media_placeholders === "function") clean = strip_tts_media_placeholders(clean);
         clean = clean.trim();
         if (!clean) return;
         if (!Array.isArray(tts_speak_input_queue)) {
@@ -1311,16 +1377,13 @@
     }
 
     function updateFromStream(fullText) {
-        const current = String(fullText || "");
-        if (!current) return;
-        if (state.finalizing) return;
+        const rawCurrent = String(fullText || "");
+        if (!rawCurrent || state.finalizing) return;
 
-        // A completed response leaves its TTS queue alive while audio plays.
-        // When a different cumulative stream appears, re-arm Live Narration for
-        // the next generation and stop/clear the previous response queue exactly
-        // as upstream tts_speak() would do when a new narrated turn begins.
+        const current = filterThinkingFromStream(rawCurrent);
+
         if (state.finalized) {
-            if (current === state.lastSnapshot) return;
+            if (rawCurrent === state.lastRawSnapshot) return;
             console.info("Live Narration: new generation detected after a completed response.");
             resetLiveState(true, true);
         }
@@ -1330,30 +1393,37 @@
             beginLiveSession();
         }
 
-        // All reviewed Lite streaming paths expose a cumulative string in
-        // synchro_pending_stream. If it shrinks or is replaced, treat this as a
-        // new generation (Retry/new response), not as a delta of the old one.
-        if (state.lastSnapshot && !current.startsWith(state.lastSnapshot)) {
+        // Treat a shrinking/replaced cumulative stream as Retry/new generation.
+        if (state.lastRawSnapshot && !rawCurrent.startsWith(state.lastRawSnapshot)) {
             console.info("Live Narration: detected a new/replaced stream; clearing the previous pending queue.");
             resetLiveState(true, true);
             if (getLiveModeReason()) return;
             beginLiveSession();
         }
 
-        if (current === state.lastSnapshot) return;
+        if (rawCurrent === state.lastRawSnapshot) return;
+
+        // Compare filtered cumulative text, not the raw text. This ensures that
+        // text following a completed </think> block is appended exactly once.
         const delta = current.startsWith(state.lastSnapshot)
             ? current.slice(state.lastSnapshot.length)
-            : current;
+            : "";
+
+        state.lastRawSnapshot = rawCurrent;
         state.lastSnapshot = current;
-        state.carry += delta;
-        enqueueCompleteSentences(state.carry, false);
+
+        if (delta) {
+            state.carry += delta;
+            enqueueCompleteSentences(state.carry, false);
+        }
     }
 
     function finishLiveSession(finalText) {
         if (!state.active || state.finalized) return;
+        const safeFinalText = filterThinkingFromStream(String(finalText || ""));
         const finalClean = typeof strip_tts_media_placeholders === "function"
-            ? strip_tts_media_placeholders(String(finalText || ""))
-            : String(finalText || "");
+            ? strip_tts_media_placeholders(safeFinalText)
+            : safeFinalText;
         const finalNormalized = normalizeForCompare(finalClean);
         const spokenNormalized = normalizeForCompare(state.spokenSentences.join(" "));
         let remainder = "";
@@ -1365,14 +1435,10 @@
         } else {
             const spokenAt = finalNormalized.indexOf(spokenNormalized);
             if (spokenAt >= 0) {
-                // A pre/post-injected context fragment may surround the streamed
-                // response. Do not replay the part already spoken.
                 remainder = (finalNormalized.slice(0, spokenAt) + " " + finalNormalized.slice(spokenAt + spokenNormalized.length)).trim();
             } else if (spokenNormalized.startsWith(finalNormalized)) {
-                // Upstream final trimming removed text that had already been queued.
                 remainder = "";
             } else {
-                // Never replay the whole answer: that would duplicate speech.
                 console.warn("Live Narration: final text does not match the spoken stream prefix; skipping final flush to avoid duplicate narration.");
                 remainder = "";
             }
@@ -1409,14 +1475,14 @@
             anchor.insertAdjacentHTML("afterend", `
                 <div class="settinglabel" id="live_narration_row">
                     <div class="justifyleft">Live Narration
-                        <span class="helpicon">?<span class="helptext">Start TTS while the LLM is still generating. Complete sentences are sent to the existing audio TTS queue as soon as they arrive. Supports XTTS, AllTalk, OpenAI-compatible TTS and KoboldCpp TTS. The existing Narration streaming option remains unchanged.</span></span>
+                        <span class="helpicon">?<span class="helptext">Start TTS while the LLM is still generating. Complete sentences are sent to the existing audio TTS queue as soon as they arrive. Supports XTTS, AllTalk, OpenAI-compatible TTS and KoboldCpp TTS. Thinking blocks are excluded from live speech. The existing Narration streaming option remains unchanged.</span></span>
                     </div>
                     <div class="push-right">
                         <input title="Live Narration during LLM generation" type="checkbox" id="tts_live_narration">
                     </div>
                 </div>
                 <div class="menutext" id="live_narration_info" style="font-size:0.9em">
-                    Live Narration uses sentence boundaries. It falls back to normal narration when hidden-thinking filtering, Narrate only dialog, or Save/Embed Narrations is enabled. Browser-only TTS is not supported by this live queue.
+                    Live Narration uses sentence boundaries. Thinking blocks are excluded. It falls back to normal narration when Narrate only dialog or Save/Embed Narrations is enabled. Browser-only TTS is not supported by this live queue.
                 </div>
             `);
             row = document.getElementById("live_narration_row");
@@ -1431,8 +1497,6 @@
         }
     }
 
-    // Add the setting to Lite's normal UI and save it through Lite's existing
-    // localsettings persistence as an ordinary UI preference.
     const previousDisplaySettings = display_settings;
     display_settings = function (...args) {
         const result = previousDisplaySettings.apply(this, args);
@@ -1449,12 +1513,6 @@
         return result;
     };
 
-
-    // The normal Send button reaches prepare_submit_generation before the new
-    // backend stream is opened. Rearm state there so even a new response whose
-    // first text happens to match the previous answer can be narrated live.
-    // Do not clear the playback queues here: audio already queued by the prior
-    // response may finish in order while the next response starts producing text.
     function armForNextGeneration() {
         if (!state.finalized) return;
         state.active = false;
@@ -1462,6 +1520,7 @@
         state.finalized = false;
         state.sessionOpen = false;
         state.lastSnapshot = "";
+        state.lastRawSnapshot = "";
         state.carry = "";
         state.spokenSentences = [];
     }
@@ -1472,9 +1531,6 @@
         return previousPrepareSubmitGeneration.apply(this, args);
     };
 
-    // Capture the first render as well as normal lightweight stream updates.
-    // The first SSE chunk can render the pending message before the lighter
-    // update_pending_stream_displays() path is called.
     const previousUpdatePending = update_pending_stream_displays;
     update_pending_stream_displays = function (...args) {
         try { updateFromStream(synchro_pending_stream); }
@@ -1492,8 +1548,6 @@
         return previousRenderGameText.apply(this, args);
     };
 
-    // The original final handler calls tts_speak() with the fully assembled text.
-    // Intercept only that synchronous final call; user-prompt narration remains intact.
     const previousTtsSpeak = tts_speak;
     tts_speak = function (text, do_download = false, do_embed_tts = false, is_test = false) {
         if (state.finalizing && state.active && !is_test) {
@@ -1513,15 +1567,10 @@
             return previousHandleIncomingText.apply(this, args);
         } finally {
             state.finalizing = false;
-            if (state.active) {
-                // If the upstream handler skipped TTS (for example TTS was disabled
-                // during generation), discard unsent fragments rather than speaking later.
-                resetLiveState(true, false);
-            }
+            if (state.active) resetLiveState(true, false);
         }
     };
 
-    // Keep stale TTS requests from appending audio after Stop/Retry/new session.
     const previousTtsSpeakDirect = tts_speak_direct;
     tts_speak_direct = function (text, do_download = false, do_embed_tts = false, is_test = false, append_to_outqueue = false) {
         if (append_to_outqueue && state.sessionOpen) {
@@ -1553,8 +1602,6 @@
         return result;
     };
 
-    // Expose small read-only diagnostics for manual testing; no network or audio
-    // capture is performed by this patch itself.
     window.__koboldLiteLiveNarration = {
         marker: LIVE_TTS_PATCH_MARKER,
         getState: () => ({
@@ -1566,9 +1613,10 @@
             pendingText: state.carry
         }),
         getModeReason: getLiveModeReason,
+        filterThinkingFromStream,
         takeCompleteSentences
     };
 
     installOutputQueueGuard();
-    console.log("KoboldAI Lite Live Narration patch v1.0.0 installed.");
+    console.log("KoboldAI Lite Live Narration patch v1.0.0 installed (thinking filter enabled).");
 })();
