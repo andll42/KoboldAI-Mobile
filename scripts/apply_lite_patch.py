@@ -9,10 +9,10 @@ import sys
 from pathlib import Path
 
 PATCH_MARKER = "KOBOLD_LITE_EXTERNAL_ASR_PATCH v5-android-asr"
-EXPECTED_LITEVER = 354
+EXPECTED_LITEVER = 355
 
 REQUIRED_ANCHORS = (
-    'const LITEVER = 354;',
+    'const LITEVER = 355;',
     'const PROTECTED_FIELDS = {',
     'const defaultsettings = JSON.parse(JSON.stringify(localsettings));',
     'function indexeddb_save(objkey, objdatastr)',

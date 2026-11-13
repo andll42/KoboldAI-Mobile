@@ -10,7 +10,7 @@ from pathlib import Path
 from apply_lite_patch import patch_source
 
 UPSTREAM_URL = "https://raw.githubusercontent.com/LostRuins/lite.koboldai.net/main/index.html"
-EXPECTED_LITEVER = 354
+EXPECTED_LITEVER = 355
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "www" / "index.html"
 EXTENSION = ROOT / "patch" / "kobold_lite_external_asr_mobile.js"
